@@ -12,21 +12,16 @@ try:
 except ImportError:
     secrets = None
 
-API_KEY = "AIzaSyDj1RU2NlVEZxgniTO3KICD50-CVZlMjjw"
-DB_URL = "https://study-bunny-default-rtdb.firebaseio.com"
-AUTH_URL = (
-    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=" + API_KEY
-)
-
+FREE_URL = "https://www.superbyte.site/account.php"
 STATE_FILE = "/study_bunny.json"
+BACKUP_FILE = "/study_bunny_backup.json"
 MIN_SESSION_S = 5 * 60
 MIN_VALID_YEAR = 2025
-TAIL_QUERY = "orderBy=%22%24key%22&limitToLast=20&"
 DEFAULT_SUBJECTS = [["Study", 0]]
 IDLE_SLEEP_MS = 2 * 60 * 1000
 TICK_S = 10
-NO_SAVE = "No cloud save yet. Press Cloud Save in the app first"
 BUNNY_W = 86
+NO_SAVE = "No save for this username. Press Cloud Save in the app first"
 
 
 # ---------------------------------------------------------------- time maths
@@ -159,90 +154,11 @@ class Tracker:
 
 
 # ------------------------------------------------------ Study Bunny data model
-def indexed(v):
-    """Firebase returns arrays as lists or, when sparse or queried, as dicts."""
-    if isinstance(v, list):
-        return [(i, x) for i, x in enumerate(v) if x is not None]
-    if isinstance(v, dict):
-        out = []
-        for k, x in v.items():
-            try:
-                out.append((int(k), x))
-            except ValueError:
-                pass
-        out.sort(key=lambda p: p[0])
-        return out
-    return []
+# The free save stores .NET DateTime ticks: 100 ns units of *local* wall-clock
+# time counted from 0001-01-01. Unix epoch is 621355968000000000 ticks.
+TICKS_EPOCH = 621355968000000000
 
 
-def find_conflict(blocks, s_ms, e_ms):
-    for b in blocks:
-        if int(b.get("sessionStarted") or 0) == s_ms and int(b.get("sessionEnded") or 0) == e_ms:
-            return "dup"
-    for b in blocks:
-        bs = int(b.get("sessionStarted") or 0)
-        be = int(b.get("sessionEnded") or 0)
-        if bs < e_ms and s_ms < be:
-            return "overlap"
-    return None
-
-
-def plan_legend(legends, at_ms, tz_s, subject, preferred):
-    """Pick a color for `subject` this month and the writes that label it."""
-    ym = month_key(at_ms, tz_s)
-    items = indexed(legends)
-    nxt = items[-1][0] + 1 if items else 0
-    for idx, leg in items:
-        if month_key(int(leg.get("monthYear") or 0), tz_s) != ym:
-            continue
-        rows = indexed(leg.get("colorsAndSubjectsOfThisMonth"))
-        for _, r in rows:
-            if r.get("subject") == subject:
-                return int(r.get("color", preferred)), []
-        used = set(int(r.get("color", -1)) for _, r in rows)
-        color = preferred
-        while color in used:
-            color += 1
-        n = rows[-1][0] + 1 if rows else 0
-        path = "monthLegends/%d/colorsAndSubjectsOfThisMonth/%d" % (idx, n)
-        return color, [(path, {"color": color, "subject": subject})]
-    entry = {
-        "monthYear": month_start_ms(at_ms, tz_s),
-        "colorsAndSubjectsOfThisMonth": [{"color": preferred, "subject": subject}],
-    }
-    return preferred, [("monthLegends/%d" % nxt, entry)]
-
-
-def subjects_from_legends(legends, limit=10):
-    items = [leg for _, leg in indexed(legends)]
-    items.sort(key=lambda leg: int(leg.get("monthYear") or 0), reverse=True)
-    out, seen = [], set()
-    for leg in items:
-        for _, r in indexed(leg.get("colorsAndSubjectsOfThisMonth")):
-            name = r.get("subject")
-            if name and name not in seen:
-                seen.add(name)
-                out.append([name, int(r.get("color", 0))])
-    return out[:limit]
-
-
-def apply_op(root, path, value):
-    parts = path.split("/")
-    cur = root
-    for p in parts[:-1]:
-        cur = cur[int(p)] if isinstance(cur, list) else cur[p]
-    last = parts[-1]
-    if isinstance(cur, list):
-        i = int(last)
-        if i >= len(cur):
-            cur.append(value)
-        else:
-            cur[i] = value
-    else:
-        cur[last] = value
-
-
-# -------------------------------------------------------------------- cloud
 class CloudError(Exception):
     pass
 
@@ -251,121 +167,324 @@ class Conflict(CloudError):
     pass
 
 
-def _err_text(data):
-    if isinstance(data, dict):
-        e = data.get("error")
-        if isinstance(e, dict):
-            return str(e.get("message", e))
-        if e:
-            return str(e)
-    return ""
+def to_ticks(local_s):
+    return TICKS_EPOCH + int(local_s) * 10000000
 
 
-def _call(method, url, body=None):
-    fn = getattr(requests, method)
-    if body is None:
-        r = fn(url)
+def from_ticks(t):
+    return (int(t) - TICKS_EPOCH) // 10000000
+
+
+def local_ym(local_s):
+    y, m, _ = civil_from_days(local_s // 86400)
+    return y, m
+
+
+def _number(s, i):
+    while i < len(s) and s[i] in " \t\r\n":
+        i += 1
+    n = 0
+    while i < len(s) and "0" <= s[i] <= "9":
+        n = n * 10 + ord(s[i]) - 48
+        i += 1
+    return n
+
+
+def _array_span(s, key):
+    """Span of the [ ... ] belonging to "key":[...] in JSON text, or None."""
+    i = s.find('"%s"' % key)
+    if i < 0:
+        return None
+    a = s.find("[", i)
+    if a < 0:
+        return None
+    depth, j, string, esc = 0, a, False, False
+    while j < len(s):
+        c = s[j]
+        if string:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                string = False
+        elif c == '"':
+            string = True
+        elif c == "[" or c == "{":
+            depth += 1
+        elif c == "]" or c == "}":
+            depth -= 1
+            if depth == 0:
+                return a, j
+        j += 1
+    return None
+
+
+def blocks_from(stats):
+    """[(start, end)] in ticks, in stored order. Scans text, no full parse."""
+    span = _array_span(stats, "sessionBlocks")
+    if span is None:
+        raise CloudError("save has no sessionBlocks")
+    body = stats[span[0] + 1:span[1]]
+    out, pos = [], 0
+    while True:
+        k = body.find('"sessionStarted":', pos)
+        if k < 0:
+            return out
+        start = _number(body, k + 17)
+        k2 = body.find('"sessionEnded":', k + 17)
+        end = _number(body, k2 + 15) if k2 >= 0 else 0
+        out.append((start, end))
+        pos = k + 1
+
+
+def find_conflict(blocks, s_ticks, e_ticks):
+    for bs, be in blocks:
+        if bs == s_ticks and be == e_ticks:
+            return "dup"
+    for bs, be in blocks:
+        if bs < e_ticks and s_ticks < be:
+            return "overlap"
+    return None
+
+
+def add_block(stats, blocks, s_ticks, e_ticks, color):
+    span = _array_span(stats, "sessionBlocks")
+    block = '{"color":%d,"sessionStarted":%d,"sessionEnded":%d}' % (
+        color, s_ticks, e_ticks
+    )
+    body = stats[span[0] + 1:span[1]]
+    if not body.strip():
+        return stats[:span[0] + 1] + block + stats[span[1]:]
+    if s_ticks >= blocks[-1][0]:
+        return stats[:span[1]] + "," + block + stats[span[1]:]
+    # Older session (uploaded late): rebuild the list in order.
+    parts, depth, start = [], 0, 0
+    for i, c in enumerate(body):
+        if c == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                parts.append(body[start:i + 1])
+    at = len(parts)
+    for i, part in enumerate(parts):
+        k = part.find('"sessionStarted":')
+        if k >= 0 and _number(part, k + 17) > s_ticks:
+            at = i
+            break
+    parts.insert(at, block)
+    return stats[:span[0] + 1] + ",".join(parts) + stats[span[1]:]
+
+
+def plan_subject(stats, local_s, subject):
+    """Return (color, stats) with this month's legend carrying `subject`."""
+    span = _array_span(stats, "monthLegends")
+    if span is None:
+        raise CloudError("save has no monthLegends")
+    body = stats[span[0] + 1:span[1]]
+    legs = json.loads("[" + body + "]") if body.strip() else []
+    y, m = local_ym(local_s)
+    hit = None
+    for leg in legs:
+        my = int(leg.get("monthYear") or 0)
+        if my < TICKS_EPOCH:
+            continue
+        if local_ym(from_ticks(my)) == (y, m):
+            hit = leg
+            break
+    if hit is None:
+        color = 0
+        legs.append({
+            "monthYear": to_ticks(local_s),
+            "colorsAndSubjectsOfThisMonth": [{"color": color, "subject": subject}],
+        })
     else:
-        r = fn(url, data=json.dumps(body), headers={"Content-Type": "application/json"})
+        rows = hit.get("colorsAndSubjectsOfThisMonth") or []
+        color = None
+        for row in rows:
+            if row.get("subject") == subject:
+                color = int(row.get("color") or 0)
+                break
+        if color is None:
+            used = set(int(r.get("color") or 0) for r in rows)
+            color = 0
+            while color in used and color < 15:
+                color += 1
+            rows.append({"color": color, "subject": subject})
+            hit["colorsAndSubjectsOfThisMonth"] = rows
+    return color, stats[:span[0]] + json.dumps(legs) + stats[span[1] + 1:]
+
+
+def subjects_from_stats(stats):
+    span = _array_span(stats, "monthLegends")
+    if span is None:
+        raise CloudError("save has no monthLegends")
+    body = stats[span[0] + 1:span[1]]
+    legs = json.loads("[" + body + "]") if body.strip() else []
+    best, best_m = None, -1
+    for leg in legs:
+        my = int(leg.get("monthYear") or 0)
+        if my > best_m:
+            best, best_m = leg, my
+    out = []
+    for row in (best or {}).get("colorsAndSubjectsOfThisMonth") or []:
+        name = row.get("subject")
+        if name:
+            out.append([name, int(row.get("color") or 0)])
+    return out[:12]
+
+
+def _string_span(s, key):
+    """Span including quotes of the value of "key":"..." in JSON text."""
+    i = s.find('"%s"' % key)
+    if i < 0:
+        return None
+    j = s.find(":", i)
+    if j < 0:
+        return None
+    j += 1
+    while j < len(s) and s[j] in " \t\r\n":
+        j += 1
+    if j >= len(s) or s[j] != '"':
+        return None
+    a = j + 1
+    j, esc = a, False
+    while j < len(s):
+        c = s[j]
+        if esc:
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif c == '"':
+            return a - 1, j + 1
+        j += 1
+    return None
+
+
+def stats_of(raw):
+    span = _string_span(raw, "stats")
+    if span is None:
+        raise CloudError("save has no stats")
+    stats = json.loads(raw[span[0]:span[1]])
+    return stats if isinstance(stats, str) else json.dumps(stats)
+
+
+def splice_stats(raw, stats):
+    span = _string_span(raw, "stats")
+    if span is None:
+        raise CloudError("save has no stats")
+    return raw[:span[0]] + json.dumps(stats) + raw[span[1]:]
+
+
+def stats_hash(s):
+    h = 2166136261
+    for ch in s:
+        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
+    return h
+
+
+HEX = b"0123456789ABCDEF"
+
+
+def urlencode(s):
+    out = bytearray()
+    for ch in s:
+        o = ord(ch)
+        if o < 33 or o > 126 or ch in "%&+=#":
+            for b in ch.encode("utf-8"):
+                out.append(37)
+                out.append(HEX[b >> 4])
+                out.append(HEX[b & 15])
+        else:
+            out.append(o)
+    return bytes(out)
+
+
+# -------------------------------------------------------------------- cloud
+def _post(fields):
+    body = b"&".join(
+        key.encode() + b"=" + urlencode(value) for key, value in fields.items()
+    )
+    r = requests.post(
+        FREE_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
     try:
         status = r.status_code
-        try:
-            data = r.json()
-        except Exception:
-            data = None
+        text = r.text
     finally:
         r.close()
     if status >= 400:
-        raise CloudError("%s %s" % (status, _err_text(data)))
-    return data
+        raise CloudError("HTTP %d from the save server" % status)
+    return (text or "").strip()
 
 
-class Cloud:
-    def __init__(self, email, password):
-        self.email = email
-        self.password = password
-        self.token = None
-        self.uid = None
+class FreeCloud:
+    """The app's free cloud save: a whole JSON blob kept on superbyte.site."""
 
-    def login(self):
-        if not self.email or not self.password:
-            raise CloudError("add STUDYBUNNY_EMAIL and STUDYBUNNY_PASSWORD to secrets.py")
-        d = _call(
-            "post",
-            AUTH_URL,
-            {"email": self.email, "password": self.password, "returnSecureToken": True},
-        )
-        self.token = d["idToken"]
-        self.uid = d["localId"]
+    def __init__(self, username):
+        self.username = username
 
-    def _url(self, path, query=""):
-        return "%s/users/%s/gameData%s.json?%sauth=%s" % (
-            DB_URL, self.uid, path, query, self.token
-        )
+    def _user(self):
+        if not self.username:
+            raise CloudError("add STUDYBUNNY_USERNAME to secrets.py")
+        return self.username
 
-    def get(self, path="", query=""):
-        return _call("get", self._url(path, query))
+    def load(self):
+        text = _post({"action": "load", "username": self._user()})
+        if text == "notfound":
+            raise CloudError(NO_SAVE)
+        if not text.startswith("{"):
+            raise CloudError("odd reply from the save server")
+        return text
 
-    def put(self, path, value):
-        return _call("put", self._url(path), value)
+    def save(self, blob):
+        text = _post({"action": "save", "username": self._user(), "data": blob})
+        if text != "saved":
+            raise CloudError("save rejected: %s" % text[:40])
 
-    def patch(self, path, value):
-        return _call("patch", self._url(path), value)
+    def submit(self, start_utc, end_utc, subject, tz_s):
+        """Append one session. Returns "ok" or "dup"; raises Conflict/CloudError."""
+        raw = self.load()
+        digest = stats_hash(raw)
+        stats = stats_of(raw)
+        s_local, e_local = start_utc + tz_s, end_utc + tz_s
+        s_ticks, e_ticks = to_ticks(s_local), to_ticks(e_local)
+        blocks = blocks_from(stats)
+        found = find_conflict(blocks, s_ticks, e_ticks)
+        if found == "dup":
+            return "dup"
+        if found:
+            raise Conflict("overlaps a session already in your save")
+        color, stats = plan_subject(stats, e_local, subject)
+        stats = add_block(stats, blocks, s_ticks, e_ticks, color)
+        blob = splice_stats(raw, stats)
+        backup(raw)
+        # Free the copies we no longer need before the upload allocates its body.
+        raw, stats, blocks = None, None, None
+        # Someone using the app in the meantime would be overwritten by us.
+        if stats_hash(self.load()) != digest:
+            raise Conflict("save changed in the app; try Sync again")
+        self.save(blob)
+        back = stats_of(self.load())
+        if (s_ticks, e_ticks) not in blocks_from(back):
+            raise CloudError("write could not be verified")
+        return "ok"
 
     def subjects(self):
-        if self.token is None:
-            self.login()
-        if not self.get("", "shallow=true&"):
-            raise CloudError(NO_SAVE)
-        return subjects_from_legends(self.get("/stats/monthLegends"))
+        return subjects_from_stats(stats_of(self.load()))
 
-    def submit(self, s_ms, e_ms, subject, preferred, tz_s):
-        """Append one finished session. Returns "ok" or "dup"; raises Conflict/CloudError."""
-        if self.token is None:
-            self.login()
-        if not self.get("", "shallow=true&"):
-            raise CloudError(NO_SAVE)
-        shape = self.get("/stats", "shallow=true&")
-        if isinstance(shape, str):
-            return self._submit_string(s_ms, e_ms, subject, preferred, tz_s)
 
-        tail = indexed(self.get("/stats/sessionBlocks", TAIL_QUERY))
-        found = find_conflict([b for _, b in tail], s_ms, e_ms)
-        if found == "dup":
-            return "dup"
-        if found:
-            raise Conflict("overlaps an existing session")
-        nxt = tail[-1][0] + 1 if tail else 0
-
-        color, ops = plan_legend(self.get("/stats/monthLegends"), s_ms, tz_s, subject, preferred)
-        for path, value in ops:
-            self.put("/stats/" + path, value)
-        block = {"color": color, "sessionStarted": s_ms, "sessionEnded": e_ms}
-        self.put("/stats/sessionBlocks/%d" % nxt, block)
-        back = self.get("/stats/sessionBlocks/%d" % nxt)
-        if not back or int(back.get("sessionStarted") or 0) != s_ms:
-            raise CloudError("write could not be verified")
-        return "ok"
-
-    def _submit_string(self, s_ms, e_ms, subject, preferred, tz_s):
-        stats = json.loads(self.get("/stats") or "{}")
-        blocks = stats.setdefault("sessionBlocks", [])
-        legends = stats.setdefault("monthLegends", [])
-        found = find_conflict([b for _, b in indexed(blocks)], s_ms, e_ms)
-        if found == "dup":
-            return "dup"
-        if found:
-            raise Conflict("overlaps an existing session")
-        color, ops = plan_legend(legends, s_ms, tz_s, subject, preferred)
-        for path, value in ops:
-            apply_op(stats, path, value)
-        blocks.append({"color": color, "sessionStarted": s_ms, "sessionEnded": e_ms})
-        blocks.sort(key=lambda b: int(b.get("sessionStarted") or 0))
-        self.patch("", {"stats": json.dumps(stats)})
-        again = json.loads(self.get("/stats") or "{}")
-        if not any(int(b.get("sessionStarted") or 0) == s_ms for b in again.get("sessionBlocks", [])):
-            raise CloudError("write could not be verified")
-        return "ok"
+def backup(text):
+    try:
+        with open(BACKUP_FILE, "w") as f:
+            f.write(text)
+    except OSError:
+        pass
 
 
 def connect_wifi(timeout_ms=30000):
@@ -535,7 +654,8 @@ class App:
 
         # subject, top right
         multi = len(self.subjects) > 1
-        name = "< %s >" % self.subject if multi else self.subject
+        shown = self.subject.strip()
+        name = "< %s >" % shown if multi else shown
         self.panel(180, 6, 80, 40)
         screen.pen = color.black
         centered("SUBJECT", 11, 1, left=180, width=80)
@@ -666,10 +786,10 @@ class App:
             self.save()
             self.say("Under 5 minutes", "not recorded")
             return
-        name, col = self.subjects[self.sel]
-        self.queue.append([start * 1000, (start + total) * 1000, name, col])
+        name = self.subject
+        self.queue.append([start, start + total, name])
         self.save()
-        self.notice("Saving...", "%d min %s" % (total // 60, name))
+        self.notice("Saving...", "%d min %s" % (total // 60, name.strip()))
         self.say(*self.flush(sync_subjects=False))
 
     # ---------------------------------------------------------------- cloud
@@ -687,12 +807,14 @@ class App:
                     rtc.time_from_ntp()
                 except Exception:
                     lines.append("NTP failed")
-            cloud = Cloud(_conf("STUDYBUNNY_EMAIL"), _conf("STUDYBUNNY_PASSWORD"))
+            cloud = FreeCloud(_conf("STUDYBUNNY_USERNAME"))
             saved = 0
             while self.queue:
-                s_ms, e_ms, name, col = self.queue[0]
+                start, end, name = self.queue[0][:3]
+                if start > 100000000000:  # queue written by an older version
+                    start, end = start // 1000, end // 1000
                 try:
-                    cloud.submit(s_ms, e_ms, name, col, tz_seconds())
+                    cloud.submit(start, end, name, tz_seconds())
                     saved += 1
                 except Conflict as e:
                     lines.append("Dropped: %s" % e)

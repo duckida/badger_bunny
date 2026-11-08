@@ -8,29 +8,50 @@ sys.path.insert(0, os.path.dirname(__file__))
 import fakes  # noqa: E402
 
 T0 = 1_762_600_000  # 2025-11-08 ~11:46 UTC
-MS = 1000
+TICKS_EPOCH = 621355968000000000
+TICK = 10 ** 7
+NOV = 1761955200  # 2025-11-01 00:00 UTC
 
 
-def game(blocks=None, legends=None, as_string=False):
+def tk(seconds):
+    """Unix seconds -> .NET ticks, as the free save stores them."""
+    return TICKS_EPOCH + int(seconds) * TICK
+
+
+def game(blocks=None, legends=None):
     stats = {
         "sessionBlocks": blocks if blocks is not None else [],
         "monthLegends": legends if legends is not None else [],
     }
-    return {"coins": 77, "carrots": 3, "ownedItems": [1, 2], "stats": json.dumps(stats) if as_string else stats}
+    return {
+        "coins": 77,
+        "carrots": 3,
+        "redeemedRefPrize": 0,
+        "refUserRedeemed": 0,
+        "playerowneditems": '{"ownedList":[]}',
+        "todo": "{}",
+        "musicowned": "{}",
+        "savedtimeandusesleft": 5,
+        "flashcards": "{}",
+        "stats": json.dumps(stats),
+    }
 
 
-def legend(month_ms, rows):
-    return {"monthYear": month_ms, "colorsAndSubjectsOfThisMonth": [{"color": c, "subject": s} for c, s in rows]}
-
-
-NOV = 1761955200000  # 2025-11-01 UTC in ms
+def legend(month_s, rows):
+    return {
+        "monthYear": tk(month_s),
+        "colorsAndSubjectsOfThisMonth": [
+            {"color": c, "subject": s} for c, s in rows
+        ],
+    }
 
 
 class Base(unittest.TestCase):
-    def boot(self, gd, epoch=T0, **kw):
-        self.db = fakes.FakeDB(gd)
+    def boot(self, blob, epoch=T0, **kw):
+        self.db = fakes.FakeDB(blob)
         self.mod, self.clock, self.pad, self.drawn = fakes.install(self.db, epoch, **kw)
         self.mod.STATE_FILE = os.path.join(self._tmp(), "state.json")
+        self.mod.BACKUP_FILE = os.path.join(self._tmp(), "backup.json")
         self.app = self.mod.App()
         return self.app
 
@@ -43,11 +64,14 @@ class Base(unittest.TestCase):
     def press(self, *btns):
         self.app.handle(list(btns))
 
-    def stats(self):
-        return self.db.root["users"][fakes.UID]["gameData"]["stats"]
+    def blob(self):
+        return json.loads(self.db.blob)
 
-    def writes(self):
-        return [e for e in self.db.log if e[0] in ("put", "patch")]
+    def stats(self):
+        return json.loads(self.blob()["stats"])
+
+    def saves(self):
+        return [e for e in self.db.log if e[0] == "save"]
 
 
 class TestTimeMaths(Base):
@@ -57,18 +81,22 @@ class TestTimeMaths(Base):
         for t in (0, 86399, 951782400, T0, 4102444800):
             import datetime as dt
             d = dt.datetime.fromtimestamp(t, dt.timezone.utc)
-            self.assertEqual(self.mod.epoch_from_tuple(d.timetuple()[:6]), calendar.timegm(d.timetuple()))
+            self.assertEqual(
+                self.mod.epoch_from_tuple(d.timetuple()[:6]),
+                calendar.timegm(d.timetuple()),
+            )
 
-    def test_month_start(self):
+    def test_ticks_round_trip(self):
         self.boot(game())
-        self.assertEqual(self.mod.month_start_ms(T0 * MS, 0), NOV)
-        self.assertEqual(self.mod.month_start_ms(NOV - 1, 0), NOV - 31 * 86400 * MS)
+        for s in (0, T0, T0 + 12345):
+            self.assertEqual(self.mod.from_ticks(self.mod.to_ticks(s)), s)
+            self.assertEqual(self.mod.to_ticks(s), tk(s))
 
-    def test_month_start_honours_timezone(self):
+    def test_ticks_to_local_month(self):
         self.boot(game())
-        # 00:30 UTC on Nov 1 is still Oct 31 in UTC-5
-        ms = NOV + 30 * 60 * MS
-        self.assertEqual(self.mod.month_start_ms(ms, -5 * 3600), NOV - 31 * 86400 * MS + 5 * 3600 * MS)
+        # 2025-11-01 00:30 local
+        self.assertEqual(self.mod.local_ym(NOV + 1800), (2025, 11))
+        self.assertEqual(self.mod.local_ym(NOV - 1), (2025, 10))
 
 
 class TestTracker(Base):
@@ -94,94 +122,154 @@ class TestTracker(Base):
 
 class TestSubmit(Base):
     def cloud(self):
-        return self.mod.Cloud("me@x.com", "pw")
+        return self.mod.FreeCloud(fakes.USERNAME)
 
-    def test_appends_block_and_only_touches_new_paths(self):
-        old = {"color": 1, "sessionStarted": (T0 - 9000) * MS, "sessionEnded": (T0 - 7200) * MS}
-        self.boot(game([old], [legend(NOV, [(1, "Math")])]))
-        before = copy.deepcopy(self.db.root)
-        res = self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Math", 1, 0)
-        self.assertEqual(res, "ok")
+    def test_appends_block_in_ticks_and_keeps_everything_else(self):
+        old = {"color": 1, "sessionStarted": tk(T0 - 9000), "sessionEnded": tk(T0 - 7200)}
+        blob = game([old], [legend(NOV + 3600, [(1, "Math")])])
+        self.boot(blob)
+        before = copy.deepcopy(self.blob())
+        self.assertEqual(self.cloud().submit(T0 - 3600, T0, "Math", 0), "ok")
         blocks = self.stats()["sessionBlocks"]
         self.assertEqual(len(blocks), 2)
-        self.assertEqual(blocks[1], {"color": 1, "sessionStarted": (T0 - 3600) * MS, "sessionEnded": T0 * MS})
-        gd = self.db.root["users"][fakes.UID]["gameData"]
-        self.assertEqual((gd["coins"], gd["carrots"], gd["ownedItems"]), (77, 3, [1, 2]))
-        self.assertEqual(blocks[0], before["users"][fakes.UID]["gameData"]["stats"]["sessionBlocks"][0])
-        for method, path, _ in self.writes():
-            self.assertTrue(path.endswith("sessionBlocks/1"), path)
+        self.assertEqual(
+            blocks[1],
+            {"color": 1, "sessionStarted": tk(T0 - 3600), "sessionEnded": tk(T0)},
+        )
+        after = self.blob()
+        self.assertEqual(after["stats"] and json.loads(after["stats"])["sessionBlocks"][0], old)
+        for key in before:
+            if key != "stats":
+                self.assertEqual(after[key], before[key], key)
+        self.assertEqual(self.saves(), [("save", fakes.USERNAME)])
 
-    def test_never_replaces_whole_blob(self):
-        self.boot(game())
-        self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Math", 2, 0)
-        for method, path, _ in self.writes():
-            self.assertIn("/stats/", path + "/")
-            self.assertNotEqual(path, "users/%s/gameData" % fakes.UID)
+    def test_stats_stays_a_string(self):
+        self.boot(game([], [legend(NOV + 3600, [(0, "Math")])]))
+        self.cloud().submit(T0 - 3600, T0, "Math", 0)
+        self.assertIsInstance(self.blob()["stats"], str)
 
-    def test_overlap_refused_and_nothing_written(self):
-        b = {"color": 1, "sessionStarted": (T0 - 3600) * MS, "sessionEnded": T0 * MS}
+    def test_overlap_refused_and_nothing_saved(self):
+        b = {"color": 1, "sessionStarted": tk(T0 - 3600), "sessionEnded": tk(T0)}
         self.boot(game([b]))
         with self.assertRaises(self.mod.Conflict):
-            self.cloud().submit((T0 - 1800) * MS, (T0 + 1800) * MS, "Math", 1, 0)
-        self.assertEqual(self.writes(), [])
+            self.cloud().submit(T0 - 1800, T0 + 1800, "Math", 0)
+        self.assertEqual(self.saves(), [])
 
     def test_resubmit_is_idempotent(self):
         self.boot(game())
         c = self.cloud()
-        self.assertEqual(c.submit((T0 - 3600) * MS, T0 * MS, "Math", 1, 0), "ok")
-        self.assertEqual(c.submit((T0 - 3600) * MS, T0 * MS, "Math", 1, 0), "dup")
+        self.assertEqual(c.submit(T0 - 3600, T0, "Math", 0), "ok")
+        self.assertEqual(c.submit(T0 - 3600, T0, "Math", 0), "dup")
         self.assertEqual(len(self.stats()["sessionBlocks"]), 1)
 
-    def test_new_subject_gets_unused_color_in_existing_month(self):
-        self.boot(game([], [legend(NOV, [(0, "Math"), (1, "Art")])]))
-        self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Bio", 0, 0)
+    def test_subject_reuses_this_months_color(self):
+        self.boot(game([], [legend(NOV + 3600, [(0, "Math"), (1, "Art")])]))
+        self.cloud().submit(T0 - 3600, T0, "Art", 0)
+        self.assertEqual(self.stats()["sessionBlocks"][0]["color"], 1)
+        rows = self.stats()["monthLegends"][0]["colorsAndSubjectsOfThisMonth"]
+        self.assertEqual(self.stats()["monthLegends"][0]["monthYear"], tk(NOV + 3600))
+        self.assertEqual(len(rows), 2)
+
+    def test_new_subject_gets_unused_color(self):
+        self.boot(game([], [legend(NOV + 3600, [(0, "Math"), (1, "Art")])]))
+        self.cloud().submit(T0 - 3600, T0, "Bio", 0)
         rows = self.stats()["monthLegends"][0]["colorsAndSubjectsOfThisMonth"]
         self.assertEqual(rows[-1], {"color": 2, "subject": "Bio"})
         self.assertEqual(self.stats()["sessionBlocks"][0]["color"], 2)
 
     def test_new_month_creates_legend(self):
-        self.boot(game([], [legend(NOV - 40 * 86400 * MS, [(3, "Math")])]))
-        self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Math", 3, 0)
+        self.boot(game([], [legend(NOV - 20 * 86400, [(3, "Math")])]))
+        self.cloud().submit(T0 - 3600, T0, "Math", 0)
         legs = self.stats()["monthLegends"]
         self.assertEqual(len(legs), 2)
-        self.assertEqual(legs[1]["monthYear"], NOV)
+        self.assertEqual(legs[1]["monthYear"], tk(T0))
+        self.assertEqual(legs[1]["colorsAndSubjectsOfThisMonth"], [{"color": 0, "subject": "Math"}])
 
-    def test_empty_stats_node(self):
-        self.boot({"coins": 1, "stats": {"monthLegends": [], "sessionBlocks": []}})
-        self.assertEqual(self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Math", 0, 0), "ok")
+    def test_trailing_space_in_subject_is_preserved(self):
+        self.boot(game([], [legend(NOV + 3600, [(8, "Physics ")])]))
+        self.cloud().submit(T0 - 3600, T0, "Physics ", 0)
+        rows = self.stats()["monthLegends"][0]["colorsAndSubjectsOfThisMonth"]
+        self.assertEqual(rows[0]["subject"], "Physics ")
+        self.assertEqual(self.stats()["sessionBlocks"][0]["color"], 8)
 
-    def test_string_encoded_stats_stays_string(self):
-        self.boot(game([], [legend(NOV, [(1, "Math")])], as_string=True))
-        self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Math", 1, 0)
-        raw = self.db.root["users"][fakes.UID]["gameData"]["stats"]
-        self.assertIsInstance(raw, str)
-        self.assertEqual(len(json.loads(raw)["sessionBlocks"]), 1)
-        self.assertEqual(self.db.root["users"][fakes.UID]["gameData"]["coins"], 77)
+    def test_older_session_is_inserted_in_order(self):
+        newer = {"color": 0, "sessionStarted": tk(T0), "sessionEnded": tk(T0 + 600)}
+        self.boot(game([newer], [legend(NOV + 3600, [(0, "Math")])]))
+        self.cloud().submit(T0 - 7200, T0 - 3600, "Math", 0)
+        starts = [b["sessionStarted"] for b in self.stats()["sessionBlocks"]]
+        self.assertEqual(starts, [tk(T0 - 7200), tk(T0)])
 
-    def test_no_cloud_save_is_refused_without_writing(self):
+    def test_large_history_still_works(self):
+        blocks = [
+            {"color": 0, "sessionStarted": tk(T0 - 628 * 3600 + i * 60),
+             "sessionEnded": tk(T0 - 628 * 3600 + i * 60 + 30)}
+            for i in range(628)
+        ]
+        self.boot(game(blocks, [legend(NOV + 3600, [(0, "Math")])]))
+        self.cloud().submit(T0 - 3600, T0, "Math", 0)
+        self.assertEqual(len(self.stats()["sessionBlocks"]), 629)
+        self.assertEqual(self.blob()["coins"], 77)
+
+    def test_no_save_is_refused(self):
         self.boot(None)
-        with self.assertRaises(self.mod.CloudError):
-            self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Math", 1, 0)
-        self.assertEqual(self.writes(), [])
-
-    def test_bad_password(self):
-        self.boot(game())
         with self.assertRaises(self.mod.CloudError) as cm:
-            self.mod.Cloud("me@x.com", "nope").login()
-        self.assertIn("INVALID_LOGIN", str(cm.exception))
+            self.cloud().submit(T0 - 3600, T0, "Math", 0)
+        self.assertIn("No save", str(cm.exception))
+        self.assertEqual(self.saves(), [])
 
-    def test_only_tail_is_fetched_for_large_history(self):
-        blocks = [{"color": 0, "sessionStarted": (T0 - 900000 + i * 1000) * MS,
-                   "sessionEnded": (T0 - 900000 + i * 1000 + 600) * MS} for i in range(400)]
-        self.boot(game(blocks))
-        self.cloud().submit((T0 - 3600) * MS, T0 * MS, "Math", 0, 0)
-        self.assertEqual(len(self.stats()["sessionBlocks"]), 401)
-        full = [e for e in self.db.log if e[0] == "get" and e[1].endswith("sessionBlocks")]
-        self.assertTrue(full, "tail query expected")
+    def test_missing_username_says_where_to_put_it(self):
+        self.boot(game(), secrets_attrs={"STUDYBUNNY_USERNAME": ""})
+        with self.assertRaises(self.mod.CloudError) as cm:
+            self.mod.FreeCloud("").submit(T0 - 3600, T0, "Math", 0)
+        self.assertIn("STUDYBUNNY_USERNAME", str(cm.exception))
 
-    def test_subjects_listed_newest_month_first(self):
-        self.boot(game([], [legend(NOV - 40 * 86400 * MS, [(0, "Old")]), legend(NOV, [(1, "Math"), (2, "Art")])]))
-        self.assertEqual(self.cloud().subjects(), [["Math", 1], ["Art", 2], ["Old", 0]])
+    def test_server_rejecting_save_is_reported(self):
+        self.boot(game())
+
+        class NoSave(fakes.FakeDB):
+            def handle(self, body):
+                if b"action=save" in body:
+                    return "?"
+                return super().handle(body)
+
+        self.db.__class__ = NoSave
+        with self.assertRaises(self.mod.CloudError) as cm:
+            self.cloud().submit(T0 - 3600, T0, "Math", 0)
+        self.assertIn("rejected", str(cm.exception))
+
+    def test_save_changed_in_the_app_between_read_and_write(self):
+        class Racy(fakes.FakeDB):
+            loads = 0
+
+            def handle(self, body):
+                if b"action=load" in body:
+                    self.loads += 1
+                    if self.loads == 2:
+                        d = json.loads(self.blob)
+                        d["coins"] = 999
+                        self.blob = json.dumps(d)
+                return super().handle(body)
+
+        self.boot(game())
+        self.db.__class__ = Racy
+        with self.assertRaises(self.mod.Conflict) as cm:
+            self.cloud().submit(T0 - 3600, T0, "Math", 0)
+        self.assertIn("changed", str(cm.exception))
+        self.assertEqual(self.saves(), [])
+
+    def test_backup_written_before_save(self):
+        self.boot(game())
+        before = self.db.blob
+        self.cloud().submit(T0 - 3600, T0, "Math", 0)
+        with open(self.mod.BACKUP_FILE) as f:
+            self.assertEqual(f.read(), before)
+
+    def test_subjects_come_from_newest_month(self):
+        self.boot(game([], [
+            legend(NOV - 40 * 86400, [(0, "Old")]),
+            legend(NOV + 3600, [(1, "Math"), (2, "Art")]),
+        ]))
+        self.assertEqual(self.cloud().subjects(), [["Math", 1], ["Art", 2]])
 
 
 class TestFlow(Base):
@@ -200,13 +288,13 @@ class TestFlow(Base):
         self.press("C")
 
     def test_start_pause_stop_uploads(self):
-        a = self.boot(game([], [legend(NOV, [])]), secrets_attrs={})
-        a.subjects = [["Math", 1]]
+        a = self.boot(game([], [legend(NOV + 3600, [(0, "Math")])]))
+        a.subjects = [["Math", 0]]
         self.run_session(40, pause_min=15)
         blocks = self.stats()["sessionBlocks"]
         self.assertEqual(len(blocks), 1)
         b = blocks[0]
-        self.assertEqual((b["sessionEnded"] - b["sessionStarted"]) // 60000, 40)
+        self.assertEqual((b["sessionEnded"] - b["sessionStarted"]) // TICK // 60, 40)
         self.assertEqual(a.queue, [])
         self.assertEqual(a.tracker.status, "idle")
 
@@ -216,7 +304,7 @@ class TestFlow(Base):
         self.clock.epoch += 120
         self.press("C")
         self.press("C")
-        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.saves(), [])
         self.assertEqual(a.queue, [])
 
     def test_confirm_back_resumes_running_session(self):
@@ -237,11 +325,12 @@ class TestFlow(Base):
         self.press("C")
         self.press("B")
         self.assertEqual(a.tracker.status, "idle")
-        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.saves(), [])
         self.assertEqual(a.queue, [])
 
     def test_offline_queues_then_retries(self):
-        a = self.boot(game([], [legend(NOV, [(0, "Study")])]), down=True)
+        blob = game([], [legend(NOV + 3600, [(0, "Study")])])
+        a = self.boot(blob, down=True)
         self.press("A")
         self.clock.epoch += 1800
         self.press("C")
@@ -249,7 +338,7 @@ class TestFlow(Base):
         self.assertEqual(len(a.queue), 1)
         self.assertIn("queued", " ".join(a.msg))
         # restart with network back: queue survives a reset
-        self.db = fakes.FakeDB(game([], [legend(NOV, [(0, "Study")])]))
+        self.db = fakes.FakeDB(blob)
         sys.modules["requests"].__dict__.update(fakes.make_requests(self.db).__dict__)
         b = self.mod.App()
         self.assertEqual(len(b.queue), 1)
@@ -260,16 +349,16 @@ class TestFlow(Base):
         self.assertEqual(len(self.stats()["sessionBlocks"]), 1)
 
     def test_conflict_is_dropped_not_retried_forever(self):
-        blk = {"color": 0, "sessionStarted": (T0 - 600) * MS, "sessionEnded": (T0 + 600) * MS}
+        blk = {"color": 0, "sessionStarted": tk(T0 - 600), "sessionEnded": tk(T0 + 600)}
         a = self.boot(game([blk]))
-        a.queue = [[(T0 - 60) * MS, (T0 + 1200) * MS, "Study", 0]]
+        a.queue = [[T0 - 60, T0 + 1200, "Study"]]
         self.press("C")
         self.assertEqual(a.queue, [])
         self.assertIn("overlaps", " ".join(a.msg))
 
     def test_transient_failure_keeps_queue(self):
         a = self.boot(game(), down=True)
-        a.queue = [[(T0 - 3600) * MS, T0 * MS, "Study", 0]]
+        a.queue = [[T0 - 3600, T0, "Study"]]
         self.press("C")
         self.assertEqual(len(a.queue), 1)
 
@@ -299,7 +388,7 @@ class TestFlow(Base):
         self.assertEqual(a.subject, "C")
 
     def test_subject_can_be_changed_on_stop_screen_before_upload(self):
-        a = self.boot(game([], [legend(NOV, [(0, "Math"), (1, "Art")])]))
+        a = self.boot(game([], [legend(NOV + 3600, [(0, "Math"), (1, "Art")])]))
         a.subjects = [["Math", 0], ["Art", 1]]
         self.press("A")
         self.clock.epoch += 1800
@@ -309,10 +398,21 @@ class TestFlow(Base):
         self.assertEqual(a.subject, "Art")
         self.assertEqual(a.view, "confirm")
         self.press("C")
-        legends = self.stats()["monthLegends"][0]["colorsAndSubjectsOfThisMonth"]
-        subjects = [r["subject"] for r in legends]
-        self.assertEqual(subjects, ["Math", "Art"])
+        rows = self.stats()["monthLegends"][0]["colorsAndSubjectsOfThisMonth"]
+        self.assertEqual([r["subject"] for r in rows], ["Math", "Art"])
         self.assertEqual(self.stats()["sessionBlocks"][0]["color"], 1)
+
+    def test_sync_loads_subjects_from_the_save(self):
+        a = self.boot(game([], [legend(NOV + 3600, [(0, "Math"), (1, "Art")])]))
+        self.press("C")
+        self.assertEqual([s[0] for s in a.subjects], ["Math", "Art"])
+        self.assertIn("2 subjects", " ".join(a.msg))
+
+    def test_sync_says_so_when_there_is_no_save(self):
+        self.boot(None)
+        self.press("C")
+        self.assertIn("No save", " ".join(self.app.msg))
+        self.assertNotIn("Up to date", " ".join(self.app.msg))
 
     def test_running_timer_wakes_every_10_seconds(self):
         a = self.boot(game())
@@ -345,13 +445,6 @@ class TestFlow(Base):
         names = [p.rsplit("bunny_", 1)[1] for p in self.drawn.loads]
         self.assertEqual(names, ["neutral.png", "happy.png", "sleep.png"])
         self.assertEqual(len(self.drawn.blits), 3)
-
-    def test_sync_with_no_cloud_save_says_so(self):
-        a = self.boot(game())
-        self.db.root["users"][fakes.UID]["gameData"] = None
-        self.press("C")
-        self.assertIn("No cloud save", " ".join(a.msg))
-        self.assertNotIn("Up to date", " ".join(a.msg))
 
     def test_draw_all_views_without_error(self):
         a = self.boot(game())

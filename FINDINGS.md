@@ -140,3 +140,25 @@ on the command line.
   return `401`/`403`.
 - Nothing here bypasses auth: you still need the account's email/password (or a
   valid refresh token).
+
+## Two cloud saves, not one
+
+The app has two separate cloud features. Do not confuse them:
+
+- **Paid "cloud perk"**: Firebase Auth + RTDB `users/<uid>/gameData`, as described
+  above. Guarded by `Cloud.DetectCloudPerk`. Not what most free users have.
+- **Free cloud save**: `https://www.superbyte.site/account.php`, form-encoded POST with
+  `action=load|save|login|register`, `username`, `password` (login only) and `data`
+  (save only). It is one whole `ExportData` JSON blob. `load` and `save` take the
+  username with **no password**, so the username alone can read or overwrite a save.
+
+Free save differences from Firebase:
+
+- `stats` is always a JSON **string**, same `sessionBlocks` / `monthLegends` shape.
+- Times are .NET `DateTime` ticks (100 ns since 0001-01-01) of **local** wall-clock
+  time, not Unix ms. Unix epoch is `621355968000000000` ticks.
+- `monthLegends[i].monthYear` is the ticks when that month's legend was created, i.e.
+  roughly the first session of the month, not the first of the month.
+- Sessions are stored in time order; there is no partial update, so a writer must load
+  the whole blob, edit, and save it back.
+- `load` returns `notfound` when the account has no save. `save` returns `saved`.
