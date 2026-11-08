@@ -3,8 +3,9 @@
 A small study timer for the Badgeware Badger. Start, pause and stop a session on the
 badge, and it adds the finished session to your **free** Study Bunny cloud save.
 
-Status: the logic passes offline tests against a fake save server, and adding a
-session to a real 628-session save works offline in those tests. It has **not** been
+Status: the logic passes 38 offline tests against a fake save server, and the save
+editing has been checked offline against a real 62 KB save: 628 sessions became 629,
+only `stats` changed, and the subject's existing colour was reused. It has **not** been
 run on a real badge yet.
 
 ## Install
@@ -102,3 +103,17 @@ cd badge && python3 -m unittest discover -s tests
 The tests replace `requests`, `wifi`, `rtc`, `badge` and `screen` with fakes, so they
 check the logic, the form posts and the JSON edits, but not on-device TLS or the
 e-ink drawing.
+
+For a real save blob there is also an offline checker, no network at all:
+
+```
+python3 tests/real_save_check.py /path/to/save.json
+```
+
+It is the raw body of a `load` reply from `account.php`. The checker feeds it to the
+real `FreeCloud.submit` through the fake server, then verifies the edited save: the
+session count grows by one, the original blocks are untouched and still in order,
+coins / carrots / items / todo / flashcards are identical, the raw bytes outside
+`stats` are unchanged, the subject's colour for the month is reused or added to the
+legend, resubmitting the same session is a no-op, and an overlapping session is
+refused.

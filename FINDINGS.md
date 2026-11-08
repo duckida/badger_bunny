@@ -162,3 +162,8 @@ Free save differences from Firebase:
 - Sessions are stored in time order; there is no partial update, so a writer must load
   the whole blob, edit, and save it back.
 - `load` returns `notfound` when the account has no save. `save` returns `saved`.
+
+The badge app in `badge/` writes to this free save. Its whole edit path (load, add one
+block and one legend row, save, verify) has been round-tripped offline against a real
+62 KB, 628-session blob with only `stats` changed; see `badge/tests/real_save_check.py`
+and `badge/README.md`.
