@@ -346,6 +346,13 @@ class TestFlow(Base):
         self.assertEqual(names, ["neutral.png", "happy.png", "sleep.png"])
         self.assertEqual(len(self.drawn.blits), 3)
 
+    def test_sync_with_no_cloud_save_says_so(self):
+        a = self.boot(game())
+        self.db.root["users"][fakes.UID]["gameData"] = None
+        self.press("C")
+        self.assertIn("No cloud save", " ".join(a.msg))
+        self.assertNotIn("Up to date", " ".join(a.msg))
+
     def test_draw_all_views_without_error(self):
         a = self.boot(game())
         a.draw()

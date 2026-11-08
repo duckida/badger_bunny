@@ -25,6 +25,7 @@ TAIL_QUERY = "orderBy=%22%24key%22&limitToLast=20&"
 DEFAULT_SUBJECTS = [["Study", 0]]
 IDLE_SLEEP_MS = 2 * 60 * 1000
 TICK_S = 10
+NO_SAVE = "No cloud save yet. Press Cloud Save in the app first"
 BUNNY_W = 86
 
 
@@ -314,6 +315,8 @@ class Cloud:
     def subjects(self):
         if self.token is None:
             self.login()
+        if not self.get("", "shallow=true&"):
+            raise CloudError(NO_SAVE)
         return subjects_from_legends(self.get("/stats/monthLegends"))
 
     def submit(self, s_ms, e_ms, subject, preferred, tz_s):
@@ -321,7 +324,7 @@ class Cloud:
         if self.token is None:
             self.login()
         if not self.get("", "shallow=true&"):
-            raise CloudError("no cloud save yet: press Cloud Save in the app first")
+            raise CloudError(NO_SAVE)
         shape = self.get("/stats", "shallow=true&")
         if isinstance(shape, str):
             return self._submit_string(s_ms, e_ms, subject, preferred, tz_s)
