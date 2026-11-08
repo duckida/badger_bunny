@@ -24,6 +24,8 @@ MIN_VALID_YEAR = 2025
 TAIL_QUERY = "orderBy=%22%24key%22&limitToLast=20&"
 DEFAULT_SUBJECTS = [["Study", 0]]
 IDLE_SLEEP_MS = 2 * 60 * 1000
+TICK_S = 10
+BUNNY_W = 86
 
 
 # ---------------------------------------------------------------- time maths
@@ -420,6 +422,7 @@ class App:
         self.view = None
         self.msg = []
         self.resume_on_back = False
+        self.images = {}
         self.load()
 
     def load(self):
@@ -448,63 +451,116 @@ class App:
         return self.subjects[self.sel][0]
 
     # -------------------------------------------------------------- drawing
+    def mood(self):
+        if self.view == "confirm":
+            return "happy" if self.tracker.elapsed(now_epoch()) >= MIN_SESSION_S else "frown"
+        return {"idle": "neutral", "running": "happy", "paused": "sleep"}[self.tracker.status]
+
+    def bunny(self, mood):
+        if mood not in self.images:
+            self.images = {}
+            for base in ("", "/system/apps/study_bunny/"):
+                try:
+                    self.images[mood] = image.load("%sassets/bunny_%s.png" % (base, mood))
+                    break
+                except Exception:
+                    pass
+            else:
+                self.images[mood] = None
+        return self.images[mood]
+
+    def backdrop(self):
+        try:
+            screen.pen = brush.pattern(color.white, color.dark_grey, 12)
+        except Exception:
+            screen.pen = color.white
+        screen.clear()
+
+    def panel(self, x, y, w, h):
+        screen.pen = color.white
+        screen.shape(shape.rounded_rectangle(x, y, w, h, 5))
+        screen.pen = color.black
+        screen.shape(shape.rounded_rectangle(x, y, w, h, 5).stroke(2))
+
+    def draw_bunny(self, mood):
+        img = self.bunny(mood)
+        x, y = (screen.width - BUNNY_W) // 2, 6
+        if img is not None:
+            screen.blit(img, vec2(x, y))
+            return
+        screen.pen = color.dark_grey
+        screen.shape(shape.ellipse(x + 20, y + 25, 9, 24))
+        screen.shape(shape.ellipse(x + 66, y + 25, 9, 24))
+        screen.shape(shape.ellipse(x + 43, y + 88, 42, 42))
+        screen.pen = color.black
+        screen.shape(shape.circle(x + 30, y + 70, 3))
+        screen.shape(shape.circle(x + 56, y + 70, 3))
+
+    def fit(self, msg, width, size):
+        while size > 1 and text_width(msg, size) > width:
+            size -= 1
+        while len(msg) > 1 and text_width(msg, size) > width:
+            msg = msg[:-1]
+        return msg, size
+
     def draw(self):
         ui, big = _rom("nope"), _rom("absolute")
         now = now_epoch()
         t = self.tracker
-        screen.pen = color.white
-        screen.clear()
-
+        self.backdrop()
         screen.pen = color.black
-        fill(0, 0, screen.width, 22)
-        screen.pen = color.white
         if ui:
             screen.font = ui
-        put_text("STUDY BUNNY", 6, 3, 2)
-        local = (now + tz_seconds()) % 86400
-        clock = "--:--" if not clock_ok() else fmt_hm(local)
-        put_text(clock, screen.width - text_width(clock, 2) - 6, 3, 2)
-
-        screen.pen = color.black
         if self.view == "msg":
-            self.draw_message(ui)
+            self.draw_message()
             return
 
+        self.draw_bunny(self.mood())
         secs = t.elapsed(now)
+
+        # status and clock, top left
         if self.view == "confirm":
             label = "STOP?"
         else:
             label = {"idle": "READY", "running": "STUDYING", "paused": "PAUSED"}[t.status]
-        centered(label, 32, 2)
+        self.panel(4, 6, 80, 40)
+        screen.pen = color.black
+        label, size = self.fit(label, 72, 2)
+        centered(label, 11, size, left=4, width=80)
+        clock = "--:--" if not clock_ok() else fmt_hm((now + tz_seconds()) % 86400)
+        centered(clock, 29, 1, left=4, width=80)
 
+        # subject, top right
+        multi = len(self.subjects) > 1
+        name = "< %s >" % self.subject if multi else self.subject
+        self.panel(180, 6, 80, 40)
+        screen.pen = color.black
+        centered("SUBJECT", 11, 1, left=180, width=80)
+        name, size = self.fit(name, 72, 2)
+        centered(name, 25, size, left=180, width=80)
+
+        # timer, over the bunny's tummy
+        self.panel(52, 108, 160, 36)
+        screen.pen = color.black
         if big:
             screen.font = big
-        face = fmt_hm(secs) if t.status == "running" else fmt_hms(secs)
-        size = 4
-        while size > 1 and text_width(face, size) > screen.width - 8:
-            size -= 1
-        centered(face, 56, size)
-
+        face = fmt_hms((secs + TICK_S // 2) // TICK_S * TICK_S) if t.status == "running" else fmt_hms(secs)
+        face, size = self.fit(face, 150, 3)
+        centered(face, 114, size, left=52, width=160)
         if ui:
             screen.font = ui
+
+        # hint bar
+        screen.pen = color.white
+        fill(0, 150, screen.width, 26)
+        screen.pen = color.black
+        fill(0, 150, screen.width, 2)
         if self.view == "confirm":
             if secs < MIN_SESSION_S:
-                centered("Under 5 min is not recorded", 112, 1)
+                self.hints("Back", "", "Drop")
             else:
-                centered("Save %d min of %s?" % (secs // 60, self.subject), 112, 1)
-            self.hints("Back", "Drop" if secs >= MIN_SESSION_S else "", "Save" if secs >= MIN_SESSION_S else "Drop")
-            return
-
-        subject = self.subject
-        if t.status == "idle":
-            subject = "< %s >" % subject if len(self.subjects) > 1 else subject
-        centered(subject, 108, 2)
-        if t.status == "idle" and not clock_ok():
-            centered("Clock not set: press C to sync", 132, 1)
-        elif self.queue:
-            centered("%d session(s) waiting to upload" % len(self.queue), 132, 1)
-
-        if t.status == "idle":
+                self.hints("Back", "Drop", "Save")
+        elif t.status == "idle":
             self.hints("Start", "", "Sync")
         elif t.status == "running":
             self.hints("Pause", "", "Stop")
@@ -513,19 +569,24 @@ class App:
 
     def hints(self, a, b, c):
         screen.pen = color.black
-        fill(0, 148, screen.width, 1)
         third = screen.width // 3
         for i, label in enumerate((a, b, c)):
             if label:
-                centered(label, 156, 2, left=i * third, width=third)
+                centered(label, 158, 2, left=i * third, width=third)
 
-    def draw_message(self, ui):
-        y = 40
+    def draw_message(self):
+        lines = []
         for line in self.msg:
-            for part in wrap(line, 20):
-                centered(part, y, 2)
-                y += 22
-        centered("press any button", 156, 1)
+            lines.extend(wrap(line, 20))
+        h = 22 * len(lines) + 16
+        y = max(4, (150 - h) // 2)
+        self.panel(12, y, screen.width - 24, h)
+        screen.pen = color.black
+        y += 10
+        for line in lines:
+            centered(line, y, 2)
+            y += 22
+        centered("press any button", 158, 1)
 
     def notice(self, *lines):
         self.view = "msg"
@@ -548,6 +609,12 @@ class App:
             self.view = None
             return
 
+        if BUTTON_UP in btns or BUTTON_DOWN in btns:
+            step = -1 if BUTTON_UP in btns else 1
+            self.sel = (self.sel + step) % len(self.subjects)
+            self.save()
+            return
+
         if self.view == "confirm":
             if BUTTON_A in btns:
                 if self.resume_on_back:
@@ -561,13 +628,7 @@ class App:
             return
 
         if t.status == "idle":
-            if BUTTON_UP in btns:
-                self.sel = (self.sel - 1) % len(self.subjects)
-                self.save()
-            elif BUTTON_DOWN in btns:
-                self.sel = (self.sel + 1) % len(self.subjects)
-                self.save()
-            elif BUTTON_A in btns:
+            if BUTTON_A in btns:
                 if clock_ok():
                     t.begin(now)
                     self.save()
@@ -669,7 +730,7 @@ def update():
 
     t = app.tracker
     if t.status == "running" and app.view is None:
-        rtc.set_alarm(minutes=1)
+        rtc.set_alarm(seconds=TICK_S - t.elapsed(now_epoch()) % TICK_S)
         wait_for_button_or_alarm(timeout=None)
     else:
         wait_for_button_or_alarm(timeout=IDLE_SLEEP_MS)

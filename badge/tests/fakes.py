@@ -111,6 +111,7 @@ def make_requests(db, accounts=None, down=False):
 class Clock:
     def __init__(self, epoch):
         self.epoch = epoch
+        self.alarms = []
 
     def datetime(self):
         import datetime as dt
@@ -118,7 +119,7 @@ class Clock:
         return (d.year, d.month, d.day, d.hour, d.minute, d.second, d.weekday())
 
     def set_alarm(self, **k):
-        pass
+        self.alarms.append(k)
 
     def clear_alarm(self):
         pass
@@ -160,7 +161,12 @@ def install(db, epoch, secrets_attrs=None, down=False, accounts=None):
 
     clock = Clock(epoch)
     pad = Pad()
-    drawn = []
+    class Drawn(list):
+        pass
+
+    drawn = Drawn()
+    blits = []
+    loads = []
 
     class Screen:
         width, height = 264, 176
@@ -179,8 +185,37 @@ def install(db, epoch, secrets_attrs=None, down=False, accounts=None):
         def rectangle(self, *a):
             pass
 
+        def shape(self, *a):
+            pass
+
+        def blit(self, *a):
+            blits.append(a)
+
     class Color:
-        white, black = "w", "k"
+        white, black, dark_grey = "w", "k", "g"
+
+    class Shape:
+        def __getattr__(self, name):
+            class S:
+                def __init__(self, *a):
+                    pass
+
+                def stroke(self, *a):
+                    return self
+            return S
+
+    class Image:
+        @staticmethod
+        def load(path):
+            if "assets/bunny_" not in path:
+                raise OSError(path)
+            loads.append(path)
+            return path
+
+    class Brush:
+        @staticmethod
+        def pattern(*a):
+            return "pat"
 
     class Badge:
         @staticmethod
@@ -194,6 +229,10 @@ def install(db, epoch, secrets_attrs=None, down=False, accounts=None):
         pressed = staticmethod(pad.pressed)
 
     ns = dict(
+        shape=Shape(),
+        image=Image,
+        brush=Brush,
+        vec2=lambda x, y: (x, y),
         rtc=clock,
         badge=Badge,
         screen=Screen(),
@@ -208,4 +247,5 @@ def install(db, epoch, secrets_attrs=None, down=False, accounts=None):
     sys.path.insert(0, __file__.rsplit("/tests/", 1)[0])
     import importlib
     mod = importlib.import_module("study_bunny")
+    drawn.blits, drawn.loads = blits, loads
     return mod, clock, pad, drawn

@@ -298,6 +298,54 @@ class TestFlow(Base):
         self.press("UP")
         self.assertEqual(a.subject, "C")
 
+    def test_subject_can_be_changed_on_stop_screen_before_upload(self):
+        a = self.boot(game([], [legend(NOV, [(0, "Math"), (1, "Art")])]))
+        a.subjects = [["Math", 0], ["Art", 1]]
+        self.press("A")
+        self.clock.epoch += 1800
+        self.press("C")
+        self.assertEqual(a.view, "confirm")
+        self.press("DOWN")
+        self.assertEqual(a.subject, "Art")
+        self.assertEqual(a.view, "confirm")
+        self.press("C")
+        legends = self.stats()["monthLegends"][0]["colorsAndSubjectsOfThisMonth"]
+        subjects = [r["subject"] for r in legends]
+        self.assertEqual(subjects, ["Math", "Art"])
+        self.assertEqual(self.stats()["sessionBlocks"][0]["color"], 1)
+
+    def test_running_timer_wakes_every_10_seconds(self):
+        a = self.boot(game())
+        self.press("A")
+        self.mod.app = a
+        self.clock.epoch += 3
+        self.mod.update()
+        self.assertEqual(self.clock.alarms[-1], {"seconds": 7})
+        self.clock.epoch += 7
+        self.mod.update()
+        self.assertEqual(self.clock.alarms[-1], {"seconds": 10})
+
+    def test_displayed_time_ticks_in_10_second_steps(self):
+        a = self.boot(game())
+        self.press("A")
+        seen = []
+        for _ in range(3):
+            self.clock.epoch += 10
+            a.draw()
+            seen.append([m for m in self.drawn if m.count(":") == 2][0])
+        self.assertEqual(seen, ["00:00:10", "00:00:20", "00:00:30"])
+
+    def test_bunny_sprite_is_drawn_for_each_mood(self):
+        a = self.boot(game())
+        a.draw()
+        self.press("A")
+        a.draw()
+        self.press("A")
+        a.draw()
+        names = [p.rsplit("bunny_", 1)[1] for p in self.drawn.loads]
+        self.assertEqual(names, ["neutral.png", "happy.png", "sleep.png"])
+        self.assertEqual(len(self.drawn.blits), 3)
+
     def test_draw_all_views_without_error(self):
         a = self.boot(game())
         a.draw()
