@@ -504,6 +504,26 @@ class TestFeedback(Base):
         self.assertIn("[study_bunny]", out)
         self.assertIn("load", out)
 
+    def test_debug_logs_each_submit_step_with_timings(self):
+        import contextlib
+        import io
+        self.boot(game([], [legend(NOV + 3600, [(0, "Math")])]),
+                  secrets_attrs={"STUDYBUNNY_DEBUG": True})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.cloud().submit(T0 - 3600, T0, "Math", 0)
+        out = buf.getvalue()
+        self.assertIn("sessions scanned", out)
+        self.assertIn("colour 0 for Math", out)
+        self.assertIn("backup written", out)
+        self.assertIn("ms)", out)
+
+    def test_read_only_filesystem_does_not_crash_the_app(self):
+        a = self.boot(game())
+        self.mod.STATE_FILE = self._tmp()  # a directory: opening it for writing fails
+        self.press("A")
+        self.assertEqual(a.tracker.status, "running")
+
     def test_silent_without_the_debug_flag(self):
         import contextlib
         import io

@@ -12,6 +12,11 @@ try:
 except ImportError:
     secrets = None
 
+try:
+    import gc
+except ImportError:  # CPython under test
+    gc = None
+
 FREE_URL = "https://www.superbyte.site/account.php"
 STATE_FILE = "/study_bunny.json"
 BACKUP_FILE = "/study_bunny_backup.json"
@@ -36,6 +41,19 @@ def log(msg):
             print("[study_bunny]", msg)
         except Exception:
             pass
+
+
+_LAP = 0
+
+
+def lap(label):
+    """Log a step and how many ms the previous one took (debug builds only)."""
+    global _LAP
+    if not DEBUG:
+        return
+    now = time.ticks_ms()
+    log("%s (%d ms)" % (label, time.ticks_diff(now, _LAP) if _LAP else 0))
+    _LAP = now
 
 
 # ---------------------------------------------------------------- time maths
@@ -386,13 +404,6 @@ def stats_of(raw):
     return stats if isinstance(stats, str) else json.dumps(stats)
 
 
-def splice_stats(raw, stats):
-    span = _string_span(raw, "stats")
-    if span is None:
-        raise CloudError("save has no stats")
-    return raw[:span[0]] + json.dumps(stats) + raw[span[1]:]
-
-
 def stats_hash(s):
     h = 2166136261
     for ch in s:
@@ -468,22 +479,36 @@ class FreeCloud:
         stage = progress if progress else log
         stage("Loading save")
         raw = self.load()
+        lap("save loaded, %d chars" % len(raw))
         digest = stats_hash(raw)
         stats = stats_of(raw)
+        lap("stats extracted, %d chars" % len(stats))
         s_local, e_local = start_utc + tz_s, end_utc + tz_s
         s_ticks, e_ticks = to_ticks(s_local), to_ticks(e_local)
         blocks = blocks_from(stats)
+        lap("%d sessions scanned" % len(blocks))
         found = find_conflict(blocks, s_ticks, e_ticks)
         if found == "dup":
             return "dup"
         if found:
             raise Conflict("overlaps a session already in your save")
         color, stats = plan_subject(stats, e_local, subject)
+        log("colour %d for %s this month" % (color, subject.strip() or "?"))
         stats = add_block(stats, blocks, s_ticks, e_ticks, color)
-        blob = splice_stats(raw, stats)
+        blocks = None
+        # Spliced by hand, not via splice_stats, so each big string can be
+        # freed the moment it stops being needed: this stretch holds most of
+        # the badge's heap at once, and every 60 KB counts.
+        span = _string_span(raw, "stats")
+        text = json.dumps(stats)
+        stats = None
+        blob = raw[:span[0]] + text + raw[span[1]:]
+        text = None
         backup(raw)
-        # Free the copies we no longer need before the upload allocates its body.
-        raw, stats, blocks = None, None, None
+        raw = None
+        lap("edited, %d chars, backup done" % len(blob))
+        if gc:
+            gc.collect()
         # Someone using the app in the meantime would be overwritten by us.
         stage("Checking for changes")
         if stats_hash(self.load()) != digest:
@@ -494,6 +519,7 @@ class FreeCloud:
         back = stats_of(self.load())
         if (s_ticks, e_ticks) not in blocks_from(back):
             raise CloudError("write could not be verified")
+        lap("verified")
         return "ok"
 
     def subjects(self):
@@ -504,8 +530,11 @@ def backup(text):
     try:
         with open(BACKUP_FILE, "w") as f:
             f.write(text)
-    except OSError:
-        pass
+        log("backup written, %d chars" % len(text))
+    except OSError as e:
+        # The badge's filesystem can be read-only, e.g. while its flash is
+        # mounted on a computer. Losing the backup is survivable.
+        log("backup failed: %s" % e)
 
 
 def connect_wifi(timeout_ms=30000):
@@ -588,8 +617,12 @@ class App:
             "sel": self.sel,
             "queue": self.queue,
         }
-        with open(STATE_FILE, "w") as f:
-            json.dump(d, f)
+        try:
+            with open(STATE_FILE, "w") as f:
+                json.dump(d, f)
+        except OSError as e:
+            # A read-only or full filesystem must not kill the app.
+            log("state write failed: %s" % e)
 
     @property
     def subject(self):
@@ -858,7 +891,9 @@ class App:
                     self.sel = min(self.sel, len(found) - 1)
                     self.save()
                     lines.append("%d subjects" % len(found))
-            return lines or ["Up to date"]
+            lines = lines or ["Up to date"]
+            log("sync done: %s" % " | ".join(lines))
+            return lines
         except Exception as e:
             log("sync failed: %s" % e)
             return self.offline(str(e)[:60])

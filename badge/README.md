@@ -3,7 +3,7 @@
 A small study timer for the Badgeware Badger. Start, pause and stop a session on the
 badge, and it adds the finished session to your **free** Study Bunny cloud save.
 
-Status: the logic passes 43 offline tests against a fake save server, and the save
+Status: the logic passes 45 offline tests against a fake save server, and the save
 editing has been checked offline against a real 62 KB save: 628 sessions became 629,
 only `stats` changed, and the subject's existing colour was reused. It has **not** been
 run on a real badge yet.
@@ -110,16 +110,34 @@ to no timeout and a stalled connection can only be escaped with a reset.
 
 Nothing is printed normally; the e-ink is the only output. To see what it is doing,
 add `STUDYBUNNY_DEBUG = True` to `secrets.py` and open the badge's serial console
-(USB, e.g. Thonny). Each phase, every request with its size, and errors are printed
-prefixed `[study_bunny]`, e.g.:
+(USB, e.g. Thonny). Each phase, every request with its size, each parsing/editing
+step with how long it took, and all errors are printed prefixed `[study_bunny]`:
 
 ```
 [study_bunny] wifi: connected
 [study_bunny] load: sending 21 bytes
 [study_bunny] reply HTTP 200, 62195 chars
-[study_bunny] Uploading
-[study_bunny] sync failed: HTTP 0 from the save server
+[study_bunny] save loaded, 62195 chars (4201 ms)
+[study_bunny] 628 sessions scanned (8312 ms)
+[study_bunny] colour 8 for Physics this month
+[study_bunny] backup written, 62195 chars
+[study_bunny] sync done: Uploaded 1 | 9 subjects
 ```
+
+The longest silent stretch is between the first `reply HTTP 200` and the next
+`load:` line — hashing, parsing and editing the whole save and writing the backup
+to the badge — and every step in it is logged, so the console shows exactly where
+time goes or where it stops.
+
+## What the app writes on the badge itself
+
+Only two files: `/study_bunny.json` (small, on every button press) and
+`/study_bunny_backup.json` (the 62 KB copy kept before each upload). The rest of
+the badge is read-only to the app. If the filesystem is read-only anyway — most
+often because the badge's flash is mounted on a computer — both writes are skipped
+with a `state write failed` / `backup failed` log line rather than crashing, though
+on some firmwares a blocked write can stall instead. Eject the badge's drive from
+the computer before syncing.
 
 ## Tests
 
