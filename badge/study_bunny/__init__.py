@@ -22,6 +22,20 @@ IDLE_SLEEP_MS = 2 * 60 * 1000
 TICK_S = 10
 BUNNY_W = 86
 NO_SAVE = "No save for this username. Press Cloud Save in the app first"
+POST_TIMEOUT_S = 20
+
+# With STUDYBUNNY_DEBUG = True in secrets.py, log() prints each phase, every
+# request and every error to the badge's serial console, prefixed so it is easy
+# to tell apart from the system's own output.
+DEBUG = bool(secrets and getattr(secrets, "STUDYBUNNY_DEBUG", False))
+
+
+def log(msg):
+    if DEBUG:
+        try:
+            print("[study_bunny]", msg)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- time maths
@@ -408,16 +422,18 @@ def _post(fields):
     body = b"&".join(
         key.encode() + b"=" + urlencode(value) for key, value in fields.items()
     )
-    r = requests.post(
-        FREE_URL,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
+    log("%s: sending %d bytes" % (fields.get("action", "?"), len(body)))
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    try:
+        r = requests.post(FREE_URL, data=body, headers=headers, timeout=POST_TIMEOUT_S)
+    except TypeError:  # this requests has no timeout argument
+        r = requests.post(FREE_URL, data=body, headers=headers)
     try:
         status = r.status_code
         text = r.text
     finally:
         r.close()
+    log("reply HTTP %d, %d chars" % (status, len(text or "")))
     if status >= 400:
         raise CloudError("HTTP %d from the save server" % status)
     return (text or "").strip()
@@ -447,8 +463,10 @@ class FreeCloud:
         if text != "saved":
             raise CloudError("save rejected: %s" % text[:40])
 
-    def submit(self, start_utc, end_utc, subject, tz_s):
+    def submit(self, start_utc, end_utc, subject, tz_s, progress=None):
         """Append one session. Returns "ok" or "dup"; raises Conflict/CloudError."""
+        stage = progress if progress else log
+        stage("Loading save")
         raw = self.load()
         digest = stats_hash(raw)
         stats = stats_of(raw)
@@ -467,9 +485,12 @@ class FreeCloud:
         # Free the copies we no longer need before the upload allocates its body.
         raw, stats, blocks = None, None, None
         # Someone using the app in the meantime would be overwritten by us.
+        stage("Checking for changes")
         if stats_hash(self.load()) != digest:
             raise Conflict("save changed in the app; try Sync again")
+        stage("Uploading")
         self.save(blob)
+        stage("Verifying")
         back = stats_of(self.load())
         if (s_ticks, e_ticks) not in blocks_from(back):
             raise CloudError("write could not be verified")
@@ -491,8 +512,10 @@ def connect_wifi(timeout_ms=30000):
     start = time.ticks_ms()
     while not wifi.connect():
         if time.ticks_diff(time.ticks_ms(), start) > timeout_ms:
+            log("wifi: gave up after %d ms" % timeout_ms)
             return False
         time.sleep(0.2)
+    log("wifi: connected")
     return True
 
 
@@ -790,22 +813,26 @@ class App:
         self.queue.append([start, start + total, name])
         self.save()
         self.notice("Saving...", "%d min %s" % (total // 60, name.strip()))
-        self.say(*self.flush(sync_subjects=False))
+        self.say(*self.flush(sync_subjects=False, progress=self.notice))
 
     # ---------------------------------------------------------------- cloud
     def sync(self):
         self.notice("Syncing...")
-        self.say(*self.flush(sync_subjects=True, ntp=True))
+        self.say(*self.flush(sync_subjects=True, ntp=True, progress=self.notice))
 
-    def flush(self, sync_subjects, ntp=False):
+    def flush(self, sync_subjects, ntp=False, progress=None):
+        stage = progress if progress else log
         lines = []
         try:
+            stage("Wi-Fi")
             if not connect_wifi():
                 return self.offline("No Wi-Fi")
             if ntp:
+                stage("Clock")
                 try:
                     rtc.time_from_ntp()
                 except Exception:
+                    log("ntp failed")
                     lines.append("NTP failed")
             cloud = FreeCloud(_conf("STUDYBUNNY_USERNAME"))
             saved = 0
@@ -814,15 +841,17 @@ class App:
                 if start > 100000000000:  # queue written by an older version
                     start, end = start // 1000, end // 1000
                 try:
-                    cloud.submit(start, end, name, tz_seconds())
+                    cloud.submit(start, end, name, tz_seconds(), progress)
                     saved += 1
                 except Conflict as e:
+                    log("dropped: %s" % e)
                     lines.append("Dropped: %s" % e)
                 self.queue.pop(0)
                 self.save()
             if saved:
                 lines.insert(0, "Uploaded %d" % saved)
             if sync_subjects:
+                stage("Subjects")
                 found = cloud.subjects()
                 if found:
                     self.subjects = found
@@ -831,6 +860,7 @@ class App:
                     lines.append("%d subjects" % len(found))
             return lines or ["Up to date"]
         except Exception as e:
+            log("sync failed: %s" % e)
             return self.offline(str(e)[:60])
         finally:
             try:

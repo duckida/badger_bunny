@@ -48,10 +48,11 @@ class Resp:
 
 def make_requests(db, down=False):
     mod = types.ModuleType("requests")
-    calls = {"n": 0}
+    calls = {"n": 0, "timeouts": []}
 
-    def post(url, data=None, headers=None):
+    def post(url, data=None, headers=None, timeout=None):
         calls["n"] += 1
+        calls["timeouts"].append(timeout)
         if down:
             raise OSError("network down")
         return Resp(200, db.handle(data))

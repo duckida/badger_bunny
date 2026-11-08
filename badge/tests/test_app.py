@@ -459,5 +459,60 @@ class TestFlow(Base):
         a.draw()
 
 
+class TestFeedback(Base):
+    def cloud(self):
+        return self.mod.FreeCloud(fakes.USERNAME)
+
+    def test_post_passes_a_timeout(self):
+        self.boot(game([], [legend(NOV + 3600, [(0, "Math")])]))
+        self.cloud().subjects()
+        self.assertEqual(
+            sys.modules["requests"].calls["timeouts"], [self.mod.POST_TIMEOUT_S]
+        )
+
+    def test_post_falls_back_when_requests_has_no_timeout_kwarg(self):
+        self.boot(game([], [legend(NOV + 3600, [(0, "Math")])]))
+        req = sys.modules["requests"]
+        real = req.post
+
+        def post(url, data=None, headers=None):
+            return real(url, data=data, headers=headers)
+
+        req.post = post
+        self.assertEqual(self.cloud().subjects(), [["Math", 0]])
+        self.assertEqual(self.db.log, [("load", fakes.USERNAME)])
+
+    def test_sync_shows_each_phase_and_the_result(self):
+        a = self.boot(game([], [legend(NOV + 3600, [(0, "Math")])]))
+        a.queue = [[T0 - 3600, T0, "Math"]]
+        seen = []
+        a.notice = lambda *lines: seen.extend(lines)
+        self.press("C")
+        for phase in ("Wi-Fi", "Clock", "Loading save",
+                      "Checking for changes", "Uploading", "Verifying", "Subjects"):
+            self.assertIn(phase, seen)
+        self.assertIn("Uploaded 1", " ".join(a.msg))
+
+    def test_debug_flag_prints_to_the_console(self):
+        import contextlib
+        import io
+        self.boot(game(), secrets_attrs={"STUDYBUNNY_DEBUG": True})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.cloud().subjects()
+        out = buf.getvalue()
+        self.assertIn("[study_bunny]", out)
+        self.assertIn("load", out)
+
+    def test_silent_without_the_debug_flag(self):
+        import contextlib
+        import io
+        self.boot(game())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.cloud().subjects()
+        self.assertEqual(buf.getvalue(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

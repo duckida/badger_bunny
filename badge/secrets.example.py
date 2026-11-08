@@ -4,3 +4,6 @@
 STUDYBUNNY_USERNAME = "your-username"
 # TIMEZONE (hours from UTC) is read from the same file and is used for the clock
 # display and for deciding which month a session belongs to.
+# Optional: set True to print what the app is doing (each sync phase, every request
+# and its size, errors) to the badge's serial console. Handy if a sync ever hangs.
+STUDYBUNNY_DEBUG = False

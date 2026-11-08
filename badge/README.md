@@ -3,7 +3,7 @@
 A small study timer for the Badgeware Badger. Start, pause and stop a session on the
 badge, and it adds the finished session to your **free** Study Bunny cloud save.
 
-Status: the logic passes 38 offline tests against a fake save server, and the save
+Status: the logic passes 43 offline tests against a fake save server, and the save
 editing has been checked offline against a real 62 KB save: 628 sessions became 629,
 only `stats` changed, and the subject's existing colour was reused. It has **not** been
 run on a real badge yet.
@@ -93,6 +93,33 @@ studying, eyes closed when paused, and frowning on Stop? if the session is too s
 to count. Status and clock are top left, subject is top right, timer across the
 bunny's tummy, and button hints along the bottom. If the images fail to load the app
 draws a plain shape bunny instead.
+
+## If it stays on Syncing...
+
+A sync is slow by nature: up to 30 s waiting for Wi-Fi, NTP, and then several HTTPS
+round trips that each carry the whole save (~62 KB: load, re-read to check nobody
+changed it, upload, verify, subjects). A minute is normal, and buttons are ignored
+until it finishes. The screen shows each phase as it goes — Wi-Fi, Clock, Loading
+save, Checking for changes, Uploading, Verifying, Subjects — so a sync that is merely
+slow keeps changing phase, and one stuck on the same phase for much longer is hanging.
+
+Every request has a 20 s timeout, so a dead connection ends in an error message
+("queued, C on home screen retries") rather than an endless Syncing... — as long as
+the badge's `requests` takes a `timeout` argument. If it does not, the app falls back
+to no timeout and a stalled connection can only be escaped with a reset.
+
+Nothing is printed normally; the e-ink is the only output. To see what it is doing,
+add `STUDYBUNNY_DEBUG = True` to `secrets.py` and open the badge's serial console
+(USB, e.g. Thonny). Each phase, every request with its size, and errors are printed
+prefixed `[study_bunny]`, e.g.:
+
+```
+[study_bunny] wifi: connected
+[study_bunny] load: sending 21 bytes
+[study_bunny] reply HTTP 200, 62195 chars
+[study_bunny] Uploading
+[study_bunny] sync failed: HTTP 0 from the save server
+```
 
 ## Tests
 
