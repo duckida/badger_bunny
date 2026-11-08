@@ -188,6 +188,14 @@ class Tracker:
 # ------------------------------------------------------ Study Bunny data model
 # The free save stores .NET DateTime ticks: 100 ns units of *local* wall-clock
 # time counted from 0001-01-01. Unix epoch is 621355968000000000 ticks.
+#
+# The blob is parsed whole with json.loads and rebuilt with json.dumps. Both
+# are C-level and finish in well under a second even for a 60 KB history,
+# while a Python-level text scan costs about a millisecond *per character* on
+# the badge (a 60 KB scan looks like a hang). The badge has ~8 MB of heap, so
+# holding the parsed save is no problem. json.dumps re-orders keys (MicroPython
+# dicts are unordered) and drops the original formatting; the app's parser does
+# not care, and every value round-trips exactly.
 TICKS_EPOCH = 621355968000000000
 
 
@@ -212,124 +220,85 @@ def local_ym(local_s):
     return y, m
 
 
-def _number(s, i):
-    while i < len(s) and s[i] in " \t\r\n":
-        i += 1
-    n = 0
-    while i < len(s) and "0" <= s[i] <= "9":
-        n = n * 10 + ord(s[i]) - 48
-        i += 1
-    return n
+def parse_save(raw):
+    """The whole save blob as a dict."""
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        raise CloudError("save is not valid JSON")
+    if not isinstance(d, dict):
+        raise CloudError("save has an odd shape")
+    return d
 
 
-def _array_span(s, key):
-    """Span of the [ ... ] belonging to "key":[...] in JSON text, or None."""
-    i = s.find('"%s"' % key)
-    if i < 0:
-        return None
-    a = s.find("[", i)
-    if a < 0:
-        return None
-    depth, j, string, esc = 0, a, False, False
-    while j < len(s):
-        c = s[j]
-        if string:
-            if esc:
-                esc = False
-            elif c == "\\":
-                esc = True
-            elif c == '"':
-                string = False
-        elif c == '"':
-            string = True
-        elif c == "[" or c == "{":
-            depth += 1
-        elif c == "]" or c == "}":
-            depth -= 1
-            if depth == 0:
-                return a, j
-        j += 1
-    return None
+def parse_stats(stats):
+    """The stats object as a dict."""
+    try:
+        st = json.loads(stats)
+    except ValueError:
+        raise CloudError("stats is not valid JSON")
+    if not isinstance(st, dict):
+        raise CloudError("stats has an odd shape")
+    return st
 
 
-def blocks_from(stats):
-    """[(start, end)] in ticks, in stored order. Scans text, no full parse."""
-    span = _array_span(stats, "sessionBlocks")
-    if span is None:
+def stats_of(raw):
+    """The stats JSON *string* out of a whole save blob."""
+    stats = parse_save(raw).get("stats")
+    if stats is None:
+        raise CloudError("save has no stats")
+    return stats if isinstance(stats, str) else json.dumps(stats, separators=(",", ":"))
+
+
+def blocks_of(st):
+    blocks = st.get("sessionBlocks")
+    if blocks is None:
         raise CloudError("save has no sessionBlocks")
-    body = stats[span[0] + 1:span[1]]
-    out, pos = [], 0
-    while True:
-        k = body.find('"sessionStarted":', pos)
-        if k < 0:
-            return out
-        start = _number(body, k + 17)
-        k2 = body.find('"sessionEnded":', k + 17)
-        end = _number(body, k2 + 15) if k2 >= 0 else 0
-        out.append((start, end))
-        pos = k + 1
+    return blocks
 
 
 def find_conflict(blocks, s_ticks, e_ticks):
-    for bs, be in blocks:
-        if bs == s_ticks and be == e_ticks:
+    for b in blocks:
+        if b.get("sessionStarted") == s_ticks and b.get("sessionEnded") == e_ticks:
             return "dup"
-    for bs, be in blocks:
-        if bs < e_ticks and s_ticks < be:
+    for b in blocks:
+        bs, be = b.get("sessionStarted"), b.get("sessionEnded")
+        if bs is not None and be is not None and bs < e_ticks and s_ticks < be:
             return "overlap"
     return None
 
 
-def add_block(stats, blocks, s_ticks, e_ticks, color):
-    span = _array_span(stats, "sessionBlocks")
-    block = '{"color":%d,"sessionStarted":%d,"sessionEnded":%d}' % (
-        color, s_ticks, e_ticks
-    )
-    body = stats[span[0] + 1:span[1]]
-    if not body.strip():
-        return stats[:span[0] + 1] + block + stats[span[1]:]
-    if s_ticks >= blocks[-1][0]:
-        return stats[:span[1]] + "," + block + stats[span[1]:]
-    # Older session (uploaded late): rebuild the list in order.
-    parts, depth, start = [], 0, 0
-    for i, c in enumerate(body):
-        if c == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                parts.append(body[start:i + 1])
-    at = len(parts)
-    for i, part in enumerate(parts):
-        k = part.find('"sessionStarted":')
-        if k >= 0 and _number(part, k + 17) > s_ticks:
+def add_block(st, s_ticks, e_ticks, color):
+    """Insert the session block in time order. Mutates the stats dict."""
+    block = {"color": color, "sessionStarted": s_ticks, "sessionEnded": e_ticks}
+    blocks = blocks_of(st)
+    at = len(blocks)
+    for i, b in enumerate(blocks):
+        if (b.get("sessionStarted") or 0) > s_ticks:
             at = i
             break
-    parts.insert(at, block)
-    return stats[:span[0] + 1] + ",".join(parts) + stats[span[1]:]
+    blocks.insert(at, block)
+    return block
 
 
-def plan_subject(stats, local_s, subject):
-    """Return (color, stats) with this month's legend carrying `subject`."""
-    span = _array_span(stats, "monthLegends")
-    if span is None:
-        raise CloudError("save has no monthLegends")
-    body = stats[span[0] + 1:span[1]]
-    legs = json.loads("[" + body + "]") if body.strip() else []
+def plan_colour(st, local_s, subject):
+    """Colour for this subject this month, added to the legend if it is new.
+
+    Mutates the stats dict's monthLegends in place and returns the colour.
+    """
+    legends = st.get("monthLegends")
+    if legends is None:
+        legends = st["monthLegends"] = []
     y, m = local_ym(local_s)
     hit = None
-    for leg in legs:
-        my = int(leg.get("monthYear") or 0)
-        if my < TICKS_EPOCH:
-            continue
-        if local_ym(from_ticks(my)) == (y, m):
+    for leg in legends:
+        my = leg.get("monthYear") or 0
+        if my >= TICKS_EPOCH and local_ym(from_ticks(my)) == (y, m):
             hit = leg
             break
     if hit is None:
         color = 0
-        legs.append({
+        legends.append({
             "monthYear": to_ticks(local_s),
             "colorsAndSubjectsOfThisMonth": [{"color": color, "subject": subject}],
         })
@@ -341,24 +310,20 @@ def plan_subject(stats, local_s, subject):
                 color = int(row.get("color") or 0)
                 break
         if color is None:
-            used = set(int(r.get("color") or 0) for r in rows)
+            used = [int(r.get("color") or 0) for r in rows]
             color = 0
             while color in used and color < 15:
                 color += 1
             rows.append({"color": color, "subject": subject})
             hit["colorsAndSubjectsOfThisMonth"] = rows
-    return color, stats[:span[0]] + json.dumps(legs) + stats[span[1] + 1:]
+    return color
 
 
-def subjects_from_stats(stats):
-    span = _array_span(stats, "monthLegends")
-    if span is None:
-        raise CloudError("save has no monthLegends")
-    body = stats[span[0] + 1:span[1]]
-    legs = json.loads("[" + body + "]") if body.strip() else []
+def subjects_from_stats(st):
+    """[name, colour] pairs from the newest month that has a legend."""
     best, best_m = None, -1
-    for leg in legs:
-        my = int(leg.get("monthYear") or 0)
+    for leg in st.get("monthLegends") or []:
+        my = leg.get("monthYear") or 0
         if my > best_m:
             best, best_m = leg, my
     out = []
@@ -369,52 +334,24 @@ def subjects_from_stats(stats):
     return out[:12]
 
 
-def _string_span(s, key):
-    """Span including quotes of the value of "key":"..." in JSON text."""
-    i = s.find('"%s"' % key)
-    if i < 0:
-        return None
-    j = s.find(":", i)
-    if j < 0:
-        return None
-    j += 1
-    while j < len(s) and s[j] in " \t\r\n":
-        j += 1
-    if j >= len(s) or s[j] != '"':
-        return None
-    a = j + 1
-    j, esc = a, False
-    while j < len(s):
-        c = s[j]
-        if esc:
-            esc = False
-        elif c == "\\":
-            esc = True
-        elif c == '"':
-            return a - 1, j + 1
-        j += 1
-    return None
-
-
-def stats_of(raw):
-    span = _string_span(raw, "stats")
-    if span is None:
-        raise CloudError("save has no stats")
-    stats = json.loads(raw[span[0]:span[1]])
-    return stats if isinstance(stats, str) else json.dumps(stats)
-
-
-def stats_hash(s):
-    h = 2166136261
-    for ch in s:
-        h = ((h ^ ord(ch)) * 16777619) & 0xFFFFFFFF
-    return h
-
-
 HEX = b"0123456789ABCDEF"
 
 
 def urlencode(s):
+    # Fast path: a pure-ASCII string needs only a handful of escapes, and
+    # str.replace is C-level. The per-character loop below costs about a
+    # millisecond per character on the badge, i.e. minutes for a save blob.
+    if len(s.encode()) == len(s):
+        return (s.replace("%", "%25")
+                .replace("&", "%26")
+                .replace("+", "%2B")
+                .replace("=", "%3D")
+                .replace("#", "%23")
+                .replace(" ", "%20")
+                .replace("\n", "%0A")
+                .replace("\r", "%0D")
+                .replace("\t", "%09")
+                .encode())
     out = bytearray()
     for ch in s:
         o = ord(ch)
@@ -480,50 +417,48 @@ class FreeCloud:
         stage("Loading save")
         raw = self.load()
         lap("save loaded, %d chars" % len(raw))
-        digest = stats_hash(raw)
-        stats = stats_of(raw)
-        lap("stats extracted, %d chars" % len(stats))
+        d = parse_save(raw)
+        stats = d.get("stats")
+        if stats is None:
+            raise CloudError("save has no stats")
+        st = parse_stats(stats if isinstance(stats, str) else json.dumps(stats))
+        lap("stats parsed")
         s_local, e_local = start_utc + tz_s, end_utc + tz_s
         s_ticks, e_ticks = to_ticks(s_local), to_ticks(e_local)
-        blocks = blocks_from(stats)
-        lap("%d sessions scanned" % len(blocks))
+        blocks = blocks_of(st)
+        log("%d sessions in save" % len(blocks))
         found = find_conflict(blocks, s_ticks, e_ticks)
         if found == "dup":
             return "dup"
         if found:
             raise Conflict("overlaps a session already in your save")
-        color, stats = plan_subject(stats, e_local, subject)
+        color = plan_colour(st, e_local, subject)
         log("colour %d for %s this month" % (color, subject.strip() or "?"))
-        stats = add_block(stats, blocks, s_ticks, e_ticks, color)
-        blocks = None
-        # Spliced by hand, not via splice_stats, so each big string can be
-        # freed the moment it stops being needed: this stretch holds most of
-        # the badge's heap at once, and every 60 KB counts.
-        span = _string_span(raw, "stats")
-        text = json.dumps(stats)
-        stats = None
-        blob = raw[:span[0]] + text + raw[span[1]:]
-        text = None
+        add_block(st, s_ticks, e_ticks, color)
+        d["stats"] = json.dumps(st, separators=(",", ":"))
+        blob = json.dumps(d, separators=(",", ":"))
+        lap("edited, %d chars" % len(blob))
         backup(raw)
-        raw = None
-        lap("edited, %d chars, backup done" % len(blob))
         if gc:
             gc.collect()
         # Someone using the app in the meantime would be overwritten by us.
+        # Comparing the reloaded text with the one we based the edit on is
+        # exact, and C-level: no hashing loop over the blob.
         stage("Checking for changes")
-        if stats_hash(self.load()) != digest:
+        if self.load() != raw:
             raise Conflict("save changed in the app; try Sync again")
         stage("Uploading")
         self.save(blob)
         stage("Verifying")
-        back = stats_of(self.load())
-        if (s_ticks, e_ticks) not in blocks_from(back):
-            raise CloudError("write could not be verified")
-        lap("verified")
-        return "ok"
+        back = parse_stats(stats_of(self.load()))
+        for b in blocks_of(back):
+            if b.get("sessionStarted") == s_ticks and b.get("sessionEnded") == e_ticks:
+                lap("verified")
+                return "ok"
+        raise CloudError("write could not be verified")
 
     def subjects(self):
-        return subjects_from_stats(stats_of(self.load()))
+        return subjects_from_stats(parse_stats(stats_of(self.load())))
 
 
 def backup(text):
@@ -539,13 +474,25 @@ def backup(text):
 
 def connect_wifi(timeout_ms=30000):
     start = time.ticks_ms()
-    while not wifi.connect():
+    while True:
+        try:
+            ok = wifi.connect()
+        except OSError as e:
+            # After a soft reboot (Thonny's Ctrl-D) the CYW43 radio can be
+            # left half-initialised and refuses every call until the badge
+            # is power-cycled. Retrying cannot fix that, so say so plainly.
+            if "EPERM" in str(e):
+                log("wifi chip stuck: %s" % e)
+                raise CloudError("Wi-Fi chip stuck: power-cycle the badge, then Sync")
+            log("wifi connect error: %s" % e)
+            ok = False
+        if ok:
+            log("wifi: connected")
+            return True
         if time.ticks_diff(time.ticks_ms(), start) > timeout_ms:
             log("wifi: gave up after %d ms" % timeout_ms)
             return False
         time.sleep(0.2)
-    log("wifi: connected")
-    return True
 
 
 def _conf(name):

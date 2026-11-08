@@ -513,10 +513,47 @@ class TestFeedback(Base):
         with contextlib.redirect_stdout(buf):
             self.cloud().submit(T0 - 3600, T0, "Math", 0)
         out = buf.getvalue()
-        self.assertIn("sessions scanned", out)
+        self.assertIn("save loaded", out)
+        self.assertIn("stats parsed", out)
+        self.assertIn("sessions in save", out)
         self.assertIn("colour 0 for Math", out)
         self.assertIn("backup written", out)
         self.assertIn("ms)", out)
+
+    def test_urlencode_fast_path_matches_the_reference_loop(self):
+        self.boot(game())
+        u, HEX = self.mod.urlencode, self.mod.HEX
+        cases = [
+            "", "plain", "a b&c=d%e+f#g", '{"stats":"{\\"x\\":1}"}',
+            "space + plus & amp = eq # hash % pc", "tab\tand\nnewline\r",
+            "non-ascii: caf\xc3\xa9 \u2713",
+        ]
+
+        def reference(s):  # the pre-fast-path per-character loop
+            out = bytearray()
+            for ch in s:
+                o = ord(ch)
+                if o < 33 or o > 126 or ch in "%&+=#":
+                    for b in ch.encode("utf-8"):
+                        out.append(37)
+                        out.append(HEX[b >> 4])
+                        out.append(HEX[b & 15])
+                else:
+                    out.append(o)
+            return bytes(out)
+
+        for s in cases:
+            self.assertEqual(u(s), reference(s), repr(s))
+
+    def test_stuck_wifi_chip_says_power_cycle(self):
+        a = self.boot(game())
+
+        def boom():
+            raise OSError(1, "EPERM")
+
+        sys.modules["wifi"].connect = boom
+        self.press("C")
+        self.assertIn("power-cycle", " ".join(a.msg))
 
     def test_read_only_filesystem_does_not_crash_the_app(self):
         a = self.boot(game())

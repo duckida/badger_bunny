@@ -112,10 +112,12 @@ def main():
     for key in before:
         if key != "stats":
             check("field untouched: " + key, after.get(key) == before[key])
-    span, span2 = mod._string_span(raw, "stats"), mod._string_span(new_raw, "stats")
-    check("raw bytes outside stats unchanged",
-          span and span2 and new_raw[:span2[0]] == raw[:span[0]]
-          and new_raw[span2[1]:] == raw[span[1]:])
+    # The blob is re-serialised from a parse (key order and formatting may
+    # change; values must not), so compare parsed content, not raw bytes.
+    check("no keys lost or added in the re-serialised blob",
+          set(after) == set(before))
+    check("stats re-parses with the same shape",
+          set(new_stats) == set(json.loads(before["stats"])))
 
     # The colour of the new block must be the colour the session month's
     # legend gives the subject afterwards.
