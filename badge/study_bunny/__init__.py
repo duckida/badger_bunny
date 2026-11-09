@@ -21,6 +21,9 @@ FREE_URL = "https://www.superbyte.site/account.php"
 STATE_FILE = "/study_bunny.json"
 BACKUP_FILE = "/study_bunny_backup.json"
 MIN_SESSION_S = 5 * 60
+COIN_STUDY_S = 10 * 60
+COIN_PAUSE_S = 7 * 60
+COIN_SESSION_MAX = 100
 MIN_VALID_YEAR = 2025
 DEFAULT_SUBJECTS = [["Study", 0]]
 IDLE_SLEEP_MS = 2 * 60 * 1000
@@ -121,6 +124,25 @@ def fmt_hms(sec):
     return "%02d:%02d:%02d" % (sec // 3600, sec // 60 % 60, sec % 60)
 
 
+# --------------------------------------------------------------- coin maths
+def coins_for(study_s, pause_s=0):
+    """Coins a finished session earns, counted the way the app does.
+
+    One coin per ten minutes studied, rounded half up; one coin off per seven
+    minutes paused, floored. The app clamps the result to 0..100 per session,
+    so a long pause can never cost more than that session earned.
+    """
+    study, pause = int(study_s), int(pause_s)
+    gross = (study + COIN_STUDY_S // 2) // COIN_STUDY_S if study > 0 else 0
+    spent = pause // COIN_PAUSE_S if pause > 0 else 0
+    earned = gross - spent
+    if earned < 0:
+        return 0
+    if earned > COIN_SESSION_MAX:
+        return COIN_SESSION_MAX
+    return earned
+
+
 def wrap(text, width):
     lines, line = [], ""
     for word in text.split(" "):
@@ -146,20 +168,25 @@ class Tracker:
         self.start = 0
         self.active = 0
         self.seg = 0
+        self.paused = 0
 
     def begin(self, now):
         self.status = "running"
         self.start = now
         self.active = 0
         self.seg = now
+        self.paused = 0
 
     def pause(self, now):
         if self.status == "running":
             self.active += max(0, now - self.seg)
+            self.seg = now
             self.status = "paused"
 
     def resume(self, now):
         if self.status == "paused":
+            if self.seg >= 0:  # -1: pause began in a build that did not track it
+                self.paused += max(0, now - self.seg)
             self.seg = now
             self.status = "running"
 
@@ -171,18 +198,31 @@ class Tracker:
         return 0
 
     def finish(self, now):
-        result = (self.start, self.elapsed(now))
+        if self.status == "running":
+            self.active += max(0, now - self.seg)
+        elif self.status == "paused" and self.seg >= 0:
+            self.paused += max(0, now - self.seg)
+        result = (self.start, self.active, self.paused)
         self.reset()
         return result
 
     def dump(self):
-        return {"s": self.status, "start": self.start, "active": self.active, "seg": self.seg}
+        return {"s": self.status, "start": self.start, "active": self.active,
+                "seg": self.seg, "paused": self.paused}
 
     def load(self, d):
         self.status = d.get("s", "idle")
         self.start = d.get("start", 0)
         self.active = d.get("active", 0)
         self.seg = d.get("seg", 0)
+        if "paused" in d:
+            self.paused = d["paused"]
+        else:
+            # State written before pause time was tracked: keep the session,
+            # but do not count an unknown pause as paused time.
+            self.paused = 0
+            if self.status == "paused":
+                self.seg = -1
 
 
 # ------------------------------------------------------ Study Bunny data model
@@ -412,7 +452,7 @@ class FreeCloud:
         if text != "saved":
             raise CloudError("save rejected: %s" % text[:40])
 
-    def submit(self, start_utc, end_utc, subject, tz_s, progress=None):
+    def submit(self, start_utc, end_utc, subject, tz_s, pause_s=0, progress=None):
         """Append one session. Returns "ok" or "dup"; raises Conflict/CloudError."""
         stage = progress if progress else log
         stage("Loading save")
@@ -436,6 +476,10 @@ class FreeCloud:
         color = plan_colour(st, e_local, subject)
         log("colour %d for %s this month" % (color, subject.strip() or "?"))
         add_block(st, s_ticks, e_ticks, color)
+        earned = coins_for(end_utc - start_utc, pause_s)
+        if earned and "coins" in d:
+            d["coins"] = int(d.get("coins") or 0) + earned
+            log("coins +%d" % earned)
         d["stats"] = json.dumps(st, separators=(",", ":"))
         blob = json.dumps(d, separators=(",", ":"))
         lap("edited, %d chars" % len(blob))
@@ -784,14 +828,14 @@ class App:
 
     def finish(self):
         t = self.tracker
-        start, total = t.finish(now_epoch())
+        start, total, paused = t.finish(now_epoch())
         self.view = None
         if total < MIN_SESSION_S:
             self.save()
             self.say("Under 5 minutes", "not recorded")
             return
         name = self.subject
-        self.queue.append([start, start + total, name])
+        self.queue.append([start, start + total, name, paused])
         self.save()
         self.notice("Saving...", "%d min %s" % (total // 60, name.strip()))
         self.say(*self.flush(sync_subjects=False, progress=self.notice))
@@ -818,11 +862,13 @@ class App:
             cloud = FreeCloud(_conf("STUDYBUNNY_USERNAME"))
             saved = 0
             while self.queue:
-                start, end, name = self.queue[0][:3]
+                entry = self.queue[0]
+                start, end, name = entry[:3]
+                paused = entry[3] if len(entry) > 3 else 0
                 if start > 100000000000:  # queue written by an older version
                     start, end = start // 1000, end // 1000
                 try:
-                    cloud.submit(start, end, name, tz_seconds(), progress)
+                    cloud.submit(start, end, name, tz_seconds(), paused, progress)
                     saved += 1
                 except Conflict as e:
                     log("dropped: %s" % e)

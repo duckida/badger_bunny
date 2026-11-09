@@ -25,11 +25,11 @@ badge/                          the badge app (installed at /system/apps/study_b
   study_bunny/__init__.py       the whole app; badgeware calls run(update) at import
   study_bunny/icon.png          menu icon
   study_bunny/assets/*.png      bunny face layers (outline/fill/face composited)
-  tests/test_app.py             offline unit tests (47 as of 2026-11)
+  tests/test_app.py             offline unit tests (56 as of 2026-11)
   tests/fakes.py                FakeDB save server + fakes for requests/wifi/rtc/
                                 badge/screen; installs them and imports the app
   tests/real_save_check.py      offline end-to-end check against a real save blob
-                                (28 checks)
+                                (29 checks)
   secrets.example.py            template for the badge's /secrets.py
   README.md                     user-facing docs — keep true, update with changes
 studybunny.py                   host CLI for the Firebase save (dry-run by default)
@@ -69,8 +69,8 @@ into issues or chat.
 
 ```bash
 cd badge
-python3 -m unittest discover -s tests          # 47 tests, ~0.2 s, no network
-python3 tests/real_save_check.py               # 28 checks vs .work/backup/free_load_raw.txt
+python3 -m unittest discover -s tests          # 56 tests, ~0.2 s, no network
+python3 tests/real_save_check.py               # 29 checks vs .work/backup/free_load_raw.txt
 python3 tests/real_save_check.py path/to/blob  # any raw `load` reply body
 
 # Host CLI (Firebase save). Reads are safe; writes are dry-run unless --apply.
@@ -97,7 +97,7 @@ update()
 `App`'s UI state is `view`: `None` = home (idle / running / paused),
 `"confirm"` = Stop? screen, `"msg"` = message panel. `Tracker` stores wall-clock
 start plus active seconds, survives sleep via `/study_bunny.json`. Stop → Save
-appends `[start_s, end_s, subject]` to `App.queue`, persists it, and
+appends `[start_s, end_s, subject, paused_s]` to `App.queue`, persists it, and
 immediately tries `flush()`; a failed submit leaves the item queued for the next
 Sync.
 
@@ -106,7 +106,7 @@ Sync.
 ```
 Wi-Fi  -> connect_wifi() (~1 s after the first initializing call)
 Clock  -> rtc.time_from_ntp() (Sync only; failure is non-fatal)
-queue  -> FreeCloud.submit(start, end, subject, tz) for each item
+queue  -> FreeCloud.submit(start, end, subject, tz, paused) for each item
           Conflict (overlap/changed save) -> dropped, reported, popped
           CloudError (network)           -> stays queued, sync aborts
 Subjects -> FreeCloud.subjects() (Sync only) refreshes the picker
@@ -121,6 +121,7 @@ parse_stats json.loads(stats string)                        ~0.3 s
 blocks_of / find_conflict  dup -> "dup"; overlap -> Conflict
 plan_colour  reuse this month's colour for the subject, or add the next free one
 add_block    insert into sessionBlocks in start order
+coins        coins_for(end - start, paused): +1/10 min studied, -1/7 min paused
 dumps        json.dumps(stats), then json.dumps(blob), separators=(",",":")
 backup       /study_bunny_backup.json (previous blob; guarded write)
 change check reload and compare text exactly (C-level !=)
@@ -142,7 +143,12 @@ verify       reload, parse, confirm (start, end) is present
   [{"color": int, "subject": str}]}]`. The newest `monthYear` drives the
   subject list (12 max in the UI). Colours are per subject per month; a new
   subject gets the next unused colour.
-- Everything else must round-trip untouched: `coins`, `carrots`,
+- `coins` is credited per session the way the app's accumulation page does it:
+  one coin per 10 minutes studied (rounded half up) minus one coin per 7 minutes
+  paused (floored), clamped to 0–100 for that session. A dup adds nothing; a
+  conflict writes nothing. The badge takes the pause length from the queue
+  entry because the block itself only stores active time.
+- Everything else must round-trip untouched: `carrots`,
   `redeemedRefPrize`, `refUserRedeemed`, `playerowneditems`, `todo`,
   `musicowned`, `savedtimeandusesleft`, `flashcards`.
 - Protocol: form POST to `https://www.superbyte.site/account.php`.
@@ -258,9 +264,10 @@ never save.
 - Keep tests deterministic: fixed epochs (`T0`, `NOV`), no clock/network/FS
   beyond `tempfile`.
 - `real_save_check.py` is the user-invariant gate for anything touching the data
-  model: session count +1, original blocks untouched and ordered, non-stats
-  fields identical, key set preserved, colour reused, resubmit no-op, overlap
-  refused with no save. Run it before committing.
+  model: session count +1, original blocks untouched and ordered, coins grow by
+  the session's formula, non-stats/coin fields identical, key set preserved,
+  colour reused, resubmit no-op, overlap refused with no save. Run it before
+  committing.
 - The fixture is gitignored; a fresh clone must pass with an explicit path.
 
 ## Code style
@@ -328,11 +335,15 @@ never save.
     primitives if it ever matters.
 15. Queue entries from older builds may be in milliseconds; `flush()` converts
     them (`start > 100000000000` → `//1000`). Keep that migration.
+16. Pre-coin-position state files have no `"paused"` key; loading a session that
+    was paused then must not count the unknown pause. `Tracker.load` sets
+    `seg = -1` for that case and `resume`/`finish` skip the accumulation. Keep
+    that migration.
 
 ## Definition of done
 
-- [ ] `python3 -m unittest discover -s tests` — all pass (47+)
-- [ ] `python3 tests/real_save_check.py` — 28/28 (when the fixture is present)
+- [ ] `python3 -m unittest discover -s tests` — all pass (56+)
+- [ ] `python3 tests/real_save_check.py` — 29/29 (when the fixture is present)
 - [ ] badge source pure ASCII; no new dependencies
 - [ ] user-facing docs updated in the same commit (`badge/README.md`)
 - [ ] anything touching runtime/device code verified on hardware, **or**

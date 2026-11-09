@@ -108,8 +108,29 @@ class TestTracker(Base):
         self.assertEqual(t.elapsed(5000), 600)
         t.resume(5000)
         self.assertEqual(t.elapsed(5400), 1000)
-        self.assertEqual(t.finish(5400), (1000, 1000))
+        self.assertEqual(t.finish(5400), (1000, 1000, 3400))
         self.assertEqual(t.status, "idle")
+        self.assertEqual(t.paused, 0)
+
+    def test_pause_time_survives_dump_load(self):
+        self.boot(game())
+        t = self.mod.Tracker()
+        t.begin(100)
+        t.pause(700)
+        u = self.mod.Tracker()
+        u.load(json.loads(json.dumps(t.dump())))
+        u.resume(1300)
+        self.assertEqual(u.paused, 600)
+        self.assertEqual(u.elapsed(1300), 600)
+
+    def test_old_state_files_do_not_invent_pause_time(self):
+        self.boot(game())
+        t = self.mod.Tracker()
+        # Pre-coin build: paused, no "paused" key, seg is the last resume.
+        t.load({"s": "paused", "start": 100, "active": 600, "seg": 400})
+        t.resume(5000)
+        self.assertEqual(t.paused, 0)
+        self.assertEqual(t.elapsed(5000), 600)
 
     def test_survives_dump_load(self):
         self.boot(game())
@@ -118,6 +139,32 @@ class TestTracker(Base):
         u = self.mod.Tracker()
         u.load(json.loads(json.dumps(t.dump())))
         self.assertEqual(u.elapsed(700), 600)
+
+
+class TestCoins(Base):
+    def test_study_is_one_coin_per_ten_minutes_rounded(self):
+        self.boot(game())
+        cases = [
+            (0, 0), (4 * 60, 0), (4 * 60 + 59, 0), (5 * 60, 1),
+            (10 * 60, 1), (14 * 60 + 59, 1), (15 * 60, 2),
+            (25 * 60, 3), (3600, 6),
+        ]
+        for secs, coins in cases:
+            self.assertEqual(self.mod.coins_for(secs), coins, secs)
+
+    def test_pause_is_one_coin_per_seven_minutes_floored(self):
+        self.boot(game())
+        cases = [
+            (0, 0), (419, 0), (420, 1), (839, 1), (840, 2), (15 * 60, 2),
+        ]
+        for secs, coins in cases:
+            self.assertEqual(self.mod.coins_for(3600, secs), 6 - coins, secs)
+
+    def test_net_is_clamped_like_the_app(self):
+        self.boot(game())
+        self.assertEqual(self.mod.coins_for(30 * 60, 60 * 60), 0)
+        self.assertEqual(self.mod.coins_for(20 * 3600), self.mod.COIN_SESSION_MAX)
+        self.assertEqual(self.mod.coins_for(3600, 3600), 0)
 
 
 class TestSubmit(Base):
@@ -139,8 +186,9 @@ class TestSubmit(Base):
         after = self.blob()
         self.assertEqual(after["stats"] and json.loads(after["stats"])["sessionBlocks"][0], old)
         for key in before:
-            if key != "stats":
+            if key != "stats" and key != "coins":
                 self.assertEqual(after[key], before[key], key)
+        self.assertEqual(after["coins"], before["coins"] + 6)
         self.assertEqual(self.saves(), [("save", fakes.USERNAME)])
 
     def test_stats_stays_a_string(self):
@@ -154,6 +202,7 @@ class TestSubmit(Base):
         with self.assertRaises(self.mod.Conflict):
             self.cloud().submit(T0 - 1800, T0 + 1800, "Math", 0)
         self.assertEqual(self.saves(), [])
+        self.assertEqual(self.blob()["coins"], 77)
 
     def test_resubmit_is_idempotent(self):
         self.boot(game())
@@ -161,6 +210,20 @@ class TestSubmit(Base):
         self.assertEqual(c.submit(T0 - 3600, T0, "Math", 0), "ok")
         self.assertEqual(c.submit(T0 - 3600, T0, "Math", 0), "dup")
         self.assertEqual(len(self.stats()["sessionBlocks"]), 1)
+        self.assertEqual(self.blob()["coins"], 77 + 6)
+
+    def test_pause_time_costs_one_coin_per_seven_minutes(self):
+        # 60 min studied = 6 coins, 21 min paused = 3 coins off.
+        self.boot(game())
+        self.cloud().submit(T0 - 3600, T0, "Math", 0, pause_s=21 * 60)
+        self.assertEqual(self.blob()["coins"], 77 + 3)
+
+    def test_deduction_cannot_bankrupt_the_save(self):
+        # 30 min studied = 3 coins, 60 min paused = 8 coins off: the app
+        # floors this session's take at zero rather than going negative.
+        self.boot(game())
+        self.cloud().submit(T0 - 1800, T0, "Math", 0, pause_s=3600)
+        self.assertEqual(self.blob()["coins"], 77)
 
     def test_subject_reuses_this_months_color(self):
         self.boot(game([], [legend(NOV + 3600, [(0, "Math"), (1, "Art")])]))
@@ -208,7 +271,7 @@ class TestSubmit(Base):
         self.boot(game(blocks, [legend(NOV + 3600, [(0, "Math")])]))
         self.cloud().submit(T0 - 3600, T0, "Math", 0)
         self.assertEqual(len(self.stats()["sessionBlocks"]), 629)
-        self.assertEqual(self.blob()["coins"], 77)
+        self.assertEqual(self.blob()["coins"], 77 + 6)
 
     def test_no_save_is_refused(self):
         self.boot(None)
@@ -297,6 +360,20 @@ class TestFlow(Base):
         self.assertEqual((b["sessionEnded"] - b["sessionStarted"]) // TICK // 60, 40)
         self.assertEqual(a.queue, [])
         self.assertEqual(a.tracker.status, "idle")
+        # 40 min studied = 4 coins, 15 min paused = 2 coins off.
+        self.assertEqual(self.blob()["coins"], 77 + 2)
+
+    def test_queued_session_carries_its_pause_time(self):
+        a = self.boot(game(), down=True)
+        self.run_session(30, pause_min=7)
+        self.assertEqual(a.queue, [[T0, T0 + 1800, "Study", 420]])
+
+    def test_old_queue_entries_without_pause_still_upload(self):
+        a = self.boot(game())
+        a.queue = [[T0 - 3600, T0, "Study"]]
+        self.press("C")
+        self.assertEqual(a.queue, [])
+        self.assertEqual(self.blob()["coins"], 77 + 6)
 
     def test_short_session_not_recorded(self):
         a = self.boot(game())
@@ -306,6 +383,7 @@ class TestFlow(Base):
         self.press("C")
         self.assertEqual(self.saves(), [])
         self.assertEqual(a.queue, [])
+        self.assertEqual(self.blob()["coins"], 77)
 
     def test_confirm_back_resumes_running_session(self):
         a = self.boot(game())

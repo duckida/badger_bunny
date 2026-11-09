@@ -3,12 +3,13 @@
 A small study timer for the Badgeware Badger. Start, pause and stop a session on the
 badge, and it adds the finished session to your **free** Study Bunny cloud save.
 
-Status: the logic passes 47 offline tests against a fake save server, and the save
+Status: the logic passes 56 offline tests against a fake save server, and the save
 editing has been checked offline against a real 62 KB save: 628 sessions became 629,
-only `stats` changed, and the subject's existing colour was reused. The installed app
-has also been run live on a real Badger 2350 against the live save: Wi-Fi, download,
-parse, edit and verify all complete in a few seconds. The one thing the test bench
-never fired is the cloud write itself, so the very first real Sync does that part.
+`stats` and `coins` were the only fields that changed, and the subject's existing
+colour was reused. The installed app has also been run live on a real Badger 2350
+against the live save: Wi-Fi, download, parse, edit and verify all complete in a few
+seconds. The one thing the test bench never fired is the cloud write itself, so the
+very first real Sync does that part.
 
 ## Install
 
@@ -51,6 +52,11 @@ Save. The session is filed under whichever subject is selected when you press Sa
 - The free save stores .NET ticks of **local** time, so the badge converts using your
   `TIMEZONE`. A session between 12:20 and 12:53 local is stored as 12:20-12:53.
 - Sessions under 5 minutes are discarded, same as the app.
+- Each saved session also changes `coins`, using the app's own accumulation
+  formula: one coin per 10 minutes studied (rounded half up) minus one coin per
+  7 minutes paused (rounded down). A long pause can only take that session's own
+  earnings, exactly like the app's accumulation page, so it is capped at 0 to
+  100 coins per session and never drives the balance negative.
 - Subjects come from the newest month in your save's month legends. Press Sync to load
   them. With no subjects the badge uses a single "Study" subject.
 - The colour for a session is the colour your subject already has this month, or the
@@ -63,14 +69,14 @@ The free save is one JSON blob behind `https://www.superbyte.site/account.php`, 
 badge:
 
 1. loads the blob and keeps a copy at `/study_bunny_backup.json` on the badge,
-2. adds one block to `stats.sessionBlocks` and, if needed, one row to this month's
-   legend,
+2. adds one block to `stats.sessionBlocks`, one row to this month's legend if needed,
+   and credits the session's coins,
 3. writes the whole blob back with `action=save`,
 4. loads it again and checks the new session is there.
 
 Before writing it also reloads the save and compares it byte for byte, so if you used
 the app in the meantime it refuses instead of overwriting your newer progress. It never
-touches coins, carrots, items, todo or flashcards. The whole blob is parsed and rebuilt
+touches carrots, items, todo or flashcards. The whole blob is parsed and rebuilt
 with the C-level `json` module — about half a second for 62 KB on the badge — rather
 than edited as text, because a Python-level text scan on this badge costs around a
 millisecond per character, and 60,000 characters of that looks exactly like a hang.
@@ -87,7 +93,9 @@ block is dropped (not retried).
 - The whole blob is overwritten on each save, so the badge's byte-for-byte check is
   the only guard against clobbering an app save made at the same moment. If the badge
   says the save changed, press Sync again.
-- Badge sessions earn no coins, carrots or streaks. Those come from the app's own timer.
+- Badge sessions credit coins with the app's own formula (10 minutes studied =
+  1 coin, 7 minutes paused = 1 coin off). Carrots and streaks still come from the
+  app's own timer.
 - While a session is running the badge redraws the timer every 10 seconds (FAST_UPDATE,
   woken by the RTC alarm) and does not deep sleep, so expect more battery use than
   idle. The shown time is rounded to the nearest 10 s.
@@ -193,7 +201,8 @@ python3 tests/real_save_check.py /path/to/save.json
 It is the raw body of a `load` reply from `account.php`. The checker feeds it to the
 real `FreeCloud.submit` through the fake server, then verifies the edited save: the
 session count grows by one, the original blocks are untouched and still in order,
-coins / carrots / items / todo / flashcards are identical, every key survives the
-re-serialisation with its value intact (key order and spacing can change), the
-subject's colour for the month is reused or added to the legend, resubmitting the same
-session is a no-op, and an overlapping session is refused.
+`coins` grows by the session's earnings, everything else (carrots / items / todo /
+flashcards) is identical, every key survives the re-serialisation with its value
+intact (key order and spacing can change), the subject's colour for the month is
+reused or added to the legend, resubmitting the same session is a no-op, and an
+overlapping session is refused.

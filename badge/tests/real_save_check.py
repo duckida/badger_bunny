@@ -10,9 +10,10 @@ ExportData JSON object with `stats` as a nested JSON string.
 The real FreeCloud.submit runs against the fake server from fakes.py, so no
 network is touched. Then the edited save is checked end to end: the session
 count grows by one, the original blocks are untouched and still in order,
-everything outside `stats` is byte-identical, the subject's colour for the
-month is reused (or added to the legend), resubmitting the same session is a
-no-op and an overlapping session is refused.
+everything outside `stats` and `coins` is unchanged, coins grow by the
+session's earnings, the subject's colour for the month is reused (or added to
+the legend), resubmitting the same session is a no-op and an overlapping
+session is refused.
 """
 import json
 import os
@@ -110,8 +111,11 @@ def main():
     check("no duplicate blocks",
           len({(b["sessionStarted"], b["sessionEnded"]) for b in new_blocks}) == len(new_blocks))
     for key in before:
-        if key != "stats":
+        if key != "stats" and key != "coins":
             check("field untouched: " + key, after.get(key) == before[key])
+    check("coins grow by the session's earnings",
+          after.get("coins") == int(before.get("coins") or 0) + mod.coins_for(end - start, 0),
+          "%s -> %s" % (before.get("coins"), after.get("coins")))
     # The blob is re-serialised from a parse (key order and formatting may
     # change; values must not), so compare parsed content, not raw bytes.
     check("no keys lost or added in the re-serialised blob",
@@ -142,6 +146,7 @@ def main():
     # Resubmitting is a no-op; an overlapping session is refused.
     check("resubmit is a no-op", cloud.submit(start, end, subject, 0) == "dup")
     check("resubmit did not save again", db.saved == 1, str(db.saved))
+    check("resubmit left the blob unchanged", db.blob == new_raw)
     try:
         cloud.submit(start + 600, end + 600, subject, 0)
         check("overlap refused", False)

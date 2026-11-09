@@ -164,6 +164,6 @@ Free save differences from Firebase:
 - `load` returns `notfound` when the account has no save. `save` returns `saved`.
 
 The badge app in `badge/` writes to this free save. Its whole edit path (load, add one
-block and one legend row, save, verify) has been round-tripped offline against a real
-62 KB, 628-session blob with only `stats` changed; see `badge/tests/real_save_check.py`
-and `badge/README.md`.
+block and one legend row, credit coins, save, verify) has been round-tripped offline
+against a real 62 KB, 628-session blob with only `stats` and `coins` changed; see
+`badge/tests/real_save_check.py` and `badge/README.md`.
