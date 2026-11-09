@@ -339,8 +339,9 @@ HEX = b"0123456789ABCDEF"
 
 def urlencode(s):
     # Fast path: a pure-ASCII string needs only a handful of escapes, and
-    # str.replace is C-level. The per-character loop below costs about a
-    # millisecond per character on the badge, i.e. minutes for a save blob.
+    # str.replace is C-level. The per-character loop below costs ~30 us per
+    # character on the badge - seconds for a save blob - so keep ASCII on the
+    # fast path.
     if len(s.encode()) == len(s):
         return (s.replace("%", "%25")
                 .replace("&", "%26")
